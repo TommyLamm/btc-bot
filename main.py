@@ -28,8 +28,9 @@ from monitor.performance_monitor import PerformanceMonitor
 
 # ═══ 交易參數 ═══
 HL_ENABLED = os.environ.get("HL_ENABLED", "true").lower() == "true"
-HL_SECRET = os.environ.get("HL_SECRET", "")
-HL_ACCOUNT = os.environ.get("HL_ACCOUNT", "")
+# 向後相容舊版環境變數命名
+HL_SECRET = (os.environ.get("HL_SECRET") or os.environ.get("HL_SECRET_KEY") or "").strip()
+HL_ACCOUNT = (os.environ.get("HL_ACCOUNT") or os.environ.get("HL_ACCOUNT_ADDRESS") or "").strip()
 HL_LEVERAGE = int(os.environ.get("HL_LEVERAGE", "3"))
 HL_ACCOUNT_SIZE = float(os.environ.get("HL_ACCOUNT_SIZE", "400"))
 
@@ -105,10 +106,17 @@ class BTCBot:
         self.today_start_bar = 0
         self.current_position_usd = BASE_POSITION_USD
         self._retrain_lock = False  # Bug 9 Fix：防止重搜重入
+        self.live_mode_reason = ""
 
         # Hyperliquid
         self.hl_executor = None
-        if HL_ENABLED and HL_SECRET and HL_ACCOUNT:
+        if not HL_ENABLED:
+            self.live_mode_reason = "HL_ENABLED=false"
+        elif not HL_SECRET:
+            self.live_mode_reason = "缺少 HL_SECRET / HL_SECRET_KEY"
+        elif not HL_ACCOUNT:
+            self.live_mode_reason = "缺少 HL_ACCOUNT / HL_ACCOUNT_ADDRESS"
+        else:
             try:
                 from executor.hyperliquid_executor import HyperliquidExecutor
                 self.hl_executor = HyperliquidExecutor(
@@ -121,8 +129,13 @@ class BTCBot:
                 )
                 print(f"  Hyperliquid 已連接: {HL_LEVERAGE}x 槓桿")
                 self._sync_local_from_hl(reason="啟動同步")
+                self.live_mode_reason = ""
             except Exception as e:
                 print(f"  Hyperliquid 初始化失敗: {e}")
+                self.live_mode_reason = f"初始化失敗: {e}"
+
+        if self.hl_executor is None and self.live_mode_reason:
+            print(f"  [HL] 實盤未啟用: {self.live_mode_reason}")
 
         # Bug 1 Fix：初始搜索移至 run() 中用 asyncio.to_thread 執行，不在 __init__ 阻塞
 
@@ -435,7 +448,8 @@ class BTCBot:
 
             if close_reason:
                 net_pnl = pnl_pct - ROUND_TRIP_FEE
-                print(f"  平倉 {self.position} @ {close:.1f} {close_reason}")
+                sim_tag = " [SIM]" if self.hl_executor is None else ""
+                print(f"  平倉 {self.position} @ {close:.1f} {close_reason}{sim_tag}")
                 hl_result = self._hl_close(close_reason)
                 # Bug 5 Fix：僅在 HL 真正成功平倉（或無 HL）時才更新本地狀態
                 hl_status = hl_result.get("status") if hl_result else None
@@ -465,9 +479,10 @@ class BTCBot:
                 conf_thr = open_thr * self.monitor.confidence_multiplier
                 pos_usd = self._calculate_position_size()
                 dir_cn = "多" if open_dir == "long" else "空"
+                sim_tag = " [SIM]" if self.hl_executor is None else ""
                 print(f"  ★ 開倉 做{dir_cn} @ {close:.1f} 信號={signal:+.3f} "
                       f"閾值={open_thr:.3f} 確認閾值={conf_thr:.3f} "
-                      f"({self.monitor.signal_confirm_bars}根確認) 倉位=${pos_usd:.0f} [{self.current_regime}]")
+                      f"({self.monitor.signal_confirm_bars}根確認) 倉位=${pos_usd:.0f} [{self.current_regime}]{sim_tag}")
                 hl_result = self._hl_open(open_dir, f"sig={signal:+.3f} thr={open_thr:.3f}")
                 # Bug 16 Fix：只在 HL 成功或無 HL 時才設定本地持倉
                 hl_status = hl_result.get("status") if hl_result else None
@@ -644,7 +659,8 @@ class BTCBot:
             print(f"  帳戶規模: ${HL_ACCOUNT_SIZE}")
             print(f"  {self.hl_executor.status_summary()}")
         else:
-            print(f"  交易模式: 純信號（未啟用實盤）")
+            reason = self.live_mode_reason or "未提供 HL 憑證"
+            print(f"  交易模式: 純信號（未啟用實盤；{reason}）")
         print(f"  ═══ 動態倉位 ═══")
         print(f"  基礎保證金: ${BASE_POSITION_USD} (範圍 ${MIN_POSITION_USD}~${MAX_POSITION_USD})")
         print(f"  目標每筆盈利: ${TARGET_PROFIT_PER_TRADE}")
