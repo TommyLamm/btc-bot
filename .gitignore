@@ -1,0 +1,54 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Runtime logs and temp files
+logs/
+*.log
+*.out
+*.err
+*.pid
+*.pid.lock
+*.tmp
+*.swp
+
+# Runtime state / local DB
+*.sqlite
+*.sqlite3
+
+# Data outputs
+*.parquet
+
+# Local backups and snapshots
+backups/
+backup_*/
+*.bak
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
