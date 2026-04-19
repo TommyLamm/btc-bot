@@ -59,6 +59,8 @@ SIGNAL_DEBUG_INTERVAL = int(os.environ.get("SIGNAL_DEBUG_INTERVAL", "3"))
 DATA_PATH = "data/btc_5m.parquet"
 OI_PATH = "data/btc_oi.parquet"
 HISTORY_BARS = 4000
+ENABLE_OI_FACTORS = os.environ.get("ENABLE_OI_FACTORS", "false").lower() == "true"
+OI_FACTOR_COLS = ("oi_roc6", "oi_roc24", "price_oi_confirm")
 
 
 class BTCBot:
@@ -118,10 +120,53 @@ class BTCBot:
                     log_path="logs/trades_v5.jsonl",
                 )
                 print(f"  Hyperliquid 已連接: {HL_LEVERAGE}x 槓桿")
+                self._sync_local_from_hl(reason="啟動同步")
             except Exception as e:
                 print(f"  Hyperliquid 初始化失敗: {e}")
 
         # Bug 1 Fix：初始搜索移至 run() 中用 asyncio.to_thread 執行，不在 __init__ 阻塞
+
+    def _sync_local_from_hl(self, fallback_dir=None, fallback_price=None, reason=""):
+        """同步本地持倉狀態到 HL，避免本地/交易所狀態漂移。"""
+        if not self.hl_executor:
+            return
+        try:
+            self.hl_executor._sync_position()
+            hl_pos = self.hl_executor.current_position
+
+            if hl_pos is None:
+                if self.position != "flat":
+                    print("  [HL] 同步: 交易所無倉位，重置本地持倉")
+                self.position = "flat"
+                self.entry_price = 0.0
+                self.entry_bar = 0
+                self.entry_atr = 0.0
+                return
+
+            self.position = hl_pos
+            hl_entry = float(self.hl_executor.entry_price or 0.0)
+            if hl_entry > 0:
+                self.entry_price = hl_entry
+            elif fallback_price is not None:
+                self.entry_price = float(fallback_price)
+
+            if self.entry_bar <= 0:
+                self.entry_bar = self.candle_count
+            if self.entry_atr <= 0 and self.current_atr > 0:
+                self.entry_atr = self.current_atr
+
+            if reason:
+                print(f"  [HL] 同步本地持倉: {self.position} ({reason})")
+        except Exception as e:
+            print(f"  [HL] 同步本地持倉失敗: {e}")
+            if fallback_dir in ("long", "short"):
+                self.position = fallback_dir
+                if fallback_price is not None:
+                    self.entry_price = float(fallback_price)
+                if self.entry_bar <= 0:
+                    self.entry_bar = self.candle_count
+                if self.entry_atr <= 0 and self.current_atr > 0:
+                    self.entry_atr = self.current_atr
 
     def _run_adaptive_search(self):
         """Bug 14 Fix：純計算，不修改任何共享狀態。返回 (result, regime, all_cols) 元組。"""
@@ -131,8 +176,10 @@ class BTCBot:
 
         df = pl.read_parquet(DATA_PATH).tail(HISTORY_BARS)
         oi_df = None
-        if os.path.exists(OI_PATH):
+        if ENABLE_OI_FACTORS and os.path.exists(OI_PATH):
             oi_df = pl.read_parquet(OI_PATH)
+        elif os.path.exists(OI_PATH):
+            print("  OI 因子已關閉（ENABLE_OI_FACTORS=false），忽略 OI 數據避免訓練/即時漂移")
 
         df = compute_factors(df, oi_df)
 
@@ -164,6 +211,8 @@ class BTCBot:
 
         from engine.genetic_engine import FACTOR_COLS as BASE_COLS
         all_cols = list(BASE_COLS) + [g for g in gp_names if g in df.columns]
+        if (not ENABLE_OI_FACTORS) or (oi_df is None):
+            all_cols = [c for c in all_cols if c not in OI_FACTOR_COLS]
         self.genetic_engine.factor_cols_used = all_cols
         # S5 Fix：不再修改全域 FACTOR_COLS，search() 已使用 self.factor_cols_used
         print(f"\n  遺傳搜索（{len(all_cols)} 個因子）...")
@@ -273,10 +322,10 @@ class BTCBot:
                 result = self.hl_executor.open_long(reason)
             else:
                 result = self.hl_executor.open_short(reason)
-            if result and result.get("status") == "ok":
+            if result and result.get("status") in ("ok", "skip"):
                 return result
             else:
-                err = result.get("error", "unknown") if result else "no result"
+                err = (result.get("msg") or result.get("error") or "unknown") if result else "no result"
                 print(f"  [HL] 開倉失敗: {err}")
                 return None
         except Exception as e:
@@ -289,14 +338,10 @@ class BTCBot:
             return None
         try:
             result = self.hl_executor.close_position(reason)
-            if result and result.get("status") == "ok":
+            if result and result.get("status") in ("ok", "skip"):
                 return result
-            elif result and "no position" in str(result.get("error", "")).lower():
-                # Bug 15 Fix：HL 確認無倉位，返回 skip 而非透傳 error status
-                print(f"  [HL] HL 上已無倉位，同步本地狀態")
-                return {"status": "skip", "msg": "HL 上已無倉位"}
             else:
-                err = result.get("error", "unknown") if result else "no result"
+                err = (result.get("msg") or result.get("error") or "unknown") if result else "no result"
                 print(f"  [HL] 平倉失敗: {err}")
                 return None
         except Exception as e:
@@ -331,21 +376,27 @@ class BTCBot:
 
         # ═══ 計算因子 ═══
         factor_values = self._compute_realtime_factors(candle)
+        factor_ready = bool(factor_values)
 
-        # S3 Fix：因子計算異常返回空字典時，重置確認計數器，跳過交易邏輯
-        if not factor_values:
+        # S3 Fix 強化：因子異常時仍執行持倉硬風控（SL/TP/超時），僅停用開倉與反轉平倉
+        if not factor_ready:
             self.monitor._confirm_long_count = 0
             self.monitor._confirm_short_count = 0
-            return
+            signal = 0.0
+            long_thr = self.monitor.search_long_threshold or 0.3
+            short_thr = self.monitor.search_short_threshold or 0.3
+            is_warmup = True
+            if self.candle_count % SIGNAL_DEBUG_INTERVAL == 0:
+                print("  [警告] 因子缺失：停用新開倉與反轉平倉，本根僅保留硬風控")
+        else:
+            # ═══ 生成信號 ═══
+            signal = self.monitor.generate_signal(factor_values)
 
-        # ═══ 生成信號 ═══
-        signal = self.monitor.generate_signal(factor_values)
-
-        # ═══ 取得閾值 ═══
-        long_thr, short_thr, is_warmup = self.monitor.get_thresholds(
-            target_trade_pct=TARGET_TRADE_PCT,
-            warmup=DYNAMIC_THRESHOLD_WARMUP,
-        )
+            # ═══ 取得閾值 ═══
+            long_thr, short_thr, is_warmup = self.monitor.get_thresholds(
+                target_trade_pct=TARGET_TRADE_PCT,
+                warmup=DYNAMIC_THRESHOLD_WARMUP,
+            )
 
         # ═══ 信號 Debug ═══
         if SIGNAL_DEBUG and self.candle_count % SIGNAL_DEBUG_INTERVAL == 0:
@@ -365,9 +416,10 @@ class BTCBot:
             pnl_pct = self._calculate_pnl(close)
 
             # 止損（自適應：高波動時放寬）
-            vol_adj = max(0.8, min(1.5, atr / (self.entry_atr + 1e-10)))
-            sl_pct = (self.entry_atr * STOP_LOSS_ATR_MULT * vol_adj) / self.entry_price
-            tp_pct = (self.entry_atr * TAKE_PROFIT_ATR_MULT) / self.entry_price
+            risk_atr = self.entry_atr if self.entry_atr > 0 else (atr if atr > 0 else close * 0.002)
+            vol_adj = max(0.8, min(1.5, atr / (risk_atr + 1e-10)))
+            sl_pct = (risk_atr * STOP_LOSS_ATR_MULT * vol_adj) / max(self.entry_price, 1e-10)
+            tp_pct = (risk_atr * TAKE_PROFIT_ATR_MULT) / max(self.entry_price, 1e-10)
 
             close_reason = None
             if pnl_pct <= -sl_pct:
@@ -376,7 +428,7 @@ class BTCBot:
                 close_reason = f"止盈 {pnl_pct:+.4f} (TP={tp_pct:.4f})"
             elif bars_held >= MAX_HOLD_BARS:
                 close_reason = f"超時 {bars_held}根 PnL={pnl_pct:+.4f}"
-            elif self.position in ("long", "short"):
+            elif factor_ready and self.position in ("long", "short"):
                 pos_dir = 1 if self.position == "long" else -1
                 if self.monitor.should_close_position(signal, pos_dir, long_thr, short_thr):
                     close_reason = f"信號反轉 sig={signal:+.3f}"
@@ -386,11 +438,15 @@ class BTCBot:
                 print(f"  平倉 {self.position} @ {close:.1f} {close_reason}")
                 hl_result = self._hl_close(close_reason)
                 # Bug 5 Fix：僅在 HL 真正成功平倉（或無 HL）時才更新本地狀態
+                hl_status = hl_result.get("status") if hl_result else None
                 hl_ok = (self.hl_executor is None) or (
-                    hl_result is not None and hl_result.get("status") in ("ok", "skip")
+                    hl_status in ("ok", "skip")
                 )
                 if hl_ok:
-                    self.monitor.record_trade(net_pnl)
+                    if self.hl_executor is None or hl_status == "ok":
+                        self.monitor.record_trade(net_pnl)
+                    elif hl_status == "skip":
+                        print("  [HL] 交易所已無倉位，重置本地狀態（不記錄本地PnL）")
                     self.position = "flat"
                     self.cooldown_remaining = COOLDOWN_BARS
                     self.today_trades += 1
@@ -401,7 +457,7 @@ class BTCBot:
                     print(f"  [警告] HL 平倉失敗，保持本地持倉狀態，下根K線重試")
 
         # ═══ 開倉邏輯 ═══
-        if self.position == "flat" and self.cooldown_remaining <= 0:
+        if factor_ready and self.position == "flat" and self.cooldown_remaining <= 0:
             direction, confirmed = self.monitor.should_open_position(signal, long_thr, short_thr)
             if confirmed and direction in (1, -1):
                 open_dir = "long" if direction == 1 else "short"
@@ -414,12 +470,20 @@ class BTCBot:
                       f"({self.monitor.signal_confirm_bars}根確認) 倉位=${pos_usd:.0f} [{self.current_regime}]")
                 hl_result = self._hl_open(open_dir, f"sig={signal:+.3f} thr={open_thr:.3f}")
                 # Bug 16 Fix：只在 HL 成功或無 HL 時才設定本地持倉
-                hl_ok = (self.hl_executor is None) or (hl_result is not None)
+                hl_status = hl_result.get("status") if hl_result else None
+                hl_ok = (self.hl_executor is None) or (hl_status in ("ok", "skip"))
                 if hl_ok:
-                    self.position = open_dir
-                    self.entry_price = close
-                    self.entry_bar = self.candle_count
-                    self.entry_atr = atr
+                    if self.hl_executor is None or hl_status == "ok":
+                        self.position = open_dir
+                        self.entry_price = close
+                        self.entry_bar = self.candle_count
+                        self.entry_atr = atr
+                    else:
+                        self._sync_local_from_hl(
+                            fallback_dir=open_dir,
+                            fallback_price=close,
+                            reason="開倉 skip 回傳",
+                        )
                 else:
                     print(f"  [警告] HL 開倉失敗，不設定本地持倉")
 
@@ -498,7 +562,11 @@ class BTCBot:
             if buf_df.height == 0:
                 return {}
 
-            factor_df = compute_factors(buf_df, oi_df=None)
+            oi_df = None
+            if ENABLE_OI_FACTORS and os.path.exists(OI_PATH):
+                oi_df = pl.read_parquet(OI_PATH)
+
+            factor_df = compute_factors(buf_df, oi_df=oi_df)
             last = factor_df.tail(1).to_dicts()[0]
 
             factor_values = {}
@@ -507,10 +575,14 @@ class BTCBot:
                     fv = float(v)
                     factor_values[k] = fv if np.isfinite(fv) else 0.0
 
-            # 沒有 OI 檔時，保底欄位為 0
-            factor_values.setdefault("oi_roc6", 0.0)
-            factor_values.setdefault("oi_roc24", 0.0)
-            factor_values.setdefault("price_oi_confirm", 0.0)
+            if not ENABLE_OI_FACTORS:
+                for oi_col in OI_FACTOR_COLS:
+                    factor_values.pop(oi_col, None)
+            else:
+                # 啟用 OI 時，缺失欄位補 0，避免特徵缺口
+                factor_values.setdefault("oi_roc6", 0.0)
+                factor_values.setdefault("oi_roc24", 0.0)
+                factor_values.setdefault("price_oi_confirm", 0.0)
 
             # GP 因子：基於完整因子時序計算最新值
             if hasattr(self, 'gp_miner') and factor_df.height >= 30:
@@ -584,6 +656,7 @@ class BTCBot:
         print(f"  目標觸發率: {TARGET_TRADE_PCT*100:.0f}%")
         print(f"  信號確認: {self.monitor.signal_confirm_bars} 根同向")
         print(f"  置信度過濾: {self.monitor.confidence_multiplier:.2f}x 閾值")
+        print(f"  OI 因子: {'啟用' if ENABLE_OI_FACTORS else '關閉（避免訓練/即時漂移）'}")
         print(f"  信號 Debug: {'開啟' if SIGNAL_DEBUG else '關閉'} (每{SIGNAL_DEBUG_INTERVAL}根K線)")
         print("=" * 60)
 
