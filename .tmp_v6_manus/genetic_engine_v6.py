@@ -106,8 +106,7 @@ class GeneticEngine:
                  threshold_range=(0.05, 1.5),
                  fee_rate=ROUND_TRIP_FEE,
                  n_interactions=8,
-                 sl_atr=1.0, tp_atr=3.0, max_hold=20,
-                 cooldown_bars=1,
+                 sl_atr=1.5, tp_atr=2.0, max_hold=18,
                  top_k_factors=20,
                  signal_confirm_bars=2,
                  confidence_multiplier=1.15):
@@ -122,7 +121,6 @@ class GeneticEngine:
         self.sl_atr = sl_atr
         self.tp_atr = tp_atr
         self.max_hold = max_hold
-        self.cooldown_bars = cooldown_bars
         self.top_k_factors = top_k_factors
         self.signal_confirm_bars = signal_confirm_bars
         self.confidence_multiplier = confidence_multiplier
@@ -345,7 +343,7 @@ class GeneticEngine:
                     net_pnl = exit_pnl - self.fee_rate - SLIPPAGE
                     trades.append((position, entry_idx, i, net_pnl))
                     position = 0
-                    cooldown = self.cooldown_bars
+                    cooldown = 3  # 冷卻期
 
         if len(trades) < 12:
             return {
@@ -699,7 +697,6 @@ class GeneticEngine:
             train_results.sort(key=lambda x: x[2], reverse=True)
 
             # v6.0 Walk-forward 驗證（3 個驗證集）
-            improved_this_gen = False
             for ind, _, train_fit in train_results[:20]:
                 val1_metrics = self._evaluate_trades(ind, X_val1, close_val1,
                                                      high_val1, low_val1, atr_val1)
@@ -739,7 +736,7 @@ class GeneticEngine:
 
                 if combined > best_combined_fitness:
                     best_combined_fitness = combined
-                    improved_this_gen = True
+                    no_improve_count = 0
                     best_individual = {
                         "weights": ind["weights"].copy(),
                         "long_threshold": ind["long_threshold"],
@@ -759,12 +756,8 @@ class GeneticEngine:
                         "val3_metrics": val3_metrics,
                     }
 
-            # S4 Fix：標準早停邏輯
-            if improved_this_gen:
-                no_improve_count = 0
-            else:
-                no_improve_count += 1
-            if no_improve_count >= 30:
+            no_improve_count += 1
+            if no_improve_count > 30:
                 print(f"  第 {gen+1} 代早停（連續 30 代無改進）")
                 break
 

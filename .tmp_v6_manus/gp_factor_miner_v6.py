@@ -713,25 +713,16 @@ class GPFactorMiner:
                 hr = self._compute_hit_rate(values, returns)
                 chr_ = self._compute_conditional_hit_rate(values, returns)
                 pers = self._compute_signal_persistence(values)
-                # M4 Fix：補齊 direction_consistency 和 multi_hz_ic
-                dir_c = self._compute_direction_consistency(values, returns)
-                multi_hz_ic = self._compute_multi_horizon_ic(values, returns, close_arr)
-                turnover = self._compute_turnover(values)
-                ic_stab = self._compute_ic_stability(values, returns)
                 # 更新因子的最新指標
                 f["ic"] = ic
                 f["hit_rate"] = hr
                 f["cond_hit_rate"] = chr_
                 f["persistence"] = pers
-                f["turnover"] = turnover
-                f["ic_stability"] = ic_stab
                 score = self._fitness_score(
                     ic, f.get("ic_ir", 0), f["tree"].size(),
                     hit_rate=hr, cond_hit_rate=chr_, persistence=pers,
-                    turnover=turnover,
-                    ic_stability=ic_stab,
-                    direction_consistency=dir_c,
-                    multi_hz_ic=multi_hz_ic)
+                    turnover=f.get("turnover", 0.5),
+                    ic_stability=f.get("ic_stability", 0.5))
                 scored.append((f, score))
             except Exception:
                 scored.append((f, -999))

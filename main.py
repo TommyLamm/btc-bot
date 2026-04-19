@@ -1,12 +1,13 @@
 """
-BTC-Bot v5.0 — 全面升級版
+BTC-Bot v6.0 — 勝率極致優化版
 改進：
-  1. 25+ 因子（波動率、成交量、微觀結構、時間、交互項）
+  1. 40+ 因子（動量、波動率、成交量、微觀結構、多時間框架、時間）
   2. 分離多空閾值 + 預熱期用搜索閾值 80%
   3. 動態倉位（交易量少加大、多縮小）+ 目標每筆 $2
-  4. 止損 1.0×ATR / 止盈 3.0×ATR（風險回報比 1:3）
-  5. Walk-forward 驗證 + 非線性交互項
-  6. 自適應止損（根據波動率調整）
+  4. 止損 SL×ATR / 止盈 TP×ATR + 自適應波動率調整
+  5. Walk-forward 6 段驗證 + 非線性交互項 + 因子 IC 三重篩選
+  6. 信號確認機制（連續同向 + 置信度過濾）
+  7. GP 因子挖掘（勝率導向 + 條件勝率 + 信號持續性）
 """
 
 import asyncio
@@ -49,6 +50,8 @@ COOLDOWN_BARS = int(os.environ.get("COOLDOWN_BARS", "1"))
 # ═══ 閾值參數 ═══
 TARGET_TRADE_PCT = float(os.environ.get("TARGET_TRADE_PCT", "0.12"))
 DYNAMIC_THRESHOLD_WARMUP = int(os.environ.get("DYNAMIC_THRESHOLD_WARMUP", "10"))
+SIGNAL_CONFIRM_BARS = int(os.environ.get("SIGNAL_CONFIRM_BARS", "2"))
+SIGNAL_CONFIDENCE_MULT = float(os.environ.get("SIGNAL_CONFIDENCE_MULT", "1.15"))
 SIGNAL_DEBUG = os.environ.get("SIGNAL_DEBUG", "true").lower() == "true"
 SIGNAL_DEBUG_INTERVAL = int(os.environ.get("SIGNAL_DEBUG_INTERVAL", "3"))
 
@@ -73,8 +76,17 @@ class BTCBot:
             threshold_range=(0.05, 1.2),
             fee_rate=ROUND_TRIP_FEE,
             n_interactions=10,
+            sl_atr=STOP_LOSS_ATR_MULT,
+            tp_atr=TAKE_PROFIT_ATR_MULT,
+            max_hold=MAX_HOLD_BARS,
+            cooldown_bars=COOLDOWN_BARS,
+            signal_confirm_bars=max(1, SIGNAL_CONFIRM_BARS),
+            confidence_multiplier=max(1.0, SIGNAL_CONFIDENCE_MULT),
         )
         self.monitor = PerformanceMonitor(window_size=200, retrain_threshold=0.40)
+        # v6.0：信號確認參數（也可被搜索結果覆蓋）
+        self.monitor.signal_confirm_bars = max(1, SIGNAL_CONFIRM_BARS)
+        self.monitor.confidence_multiplier = max(1.0, SIGNAL_CONFIDENCE_MULT)
 
         self.current_regime = "unknown"
         self.active_factor_cols = list(FACTOR_COLS)
@@ -140,7 +152,7 @@ class BTCBot:
                 factor_data[col] = df[col].to_numpy().astype(np.float64)
             except Exception:
                 pass
-        gp_factors = self.gp_miner.mine(factor_data, ret)
+        gp_factors = self.gp_miner.mine(factor_data, ret, close_arr=close)
 
         # 將 GP 因子加入 DataFrame
         gp_data = self.gp_miner.compute_gp_factors(factor_data)
@@ -151,22 +163,24 @@ class BTCBot:
         gp_names = self.gp_miner.get_factor_names()
 
         from engine.genetic_engine import FACTOR_COLS as BASE_COLS
-        import engine.genetic_engine as ge_mod
         all_cols = list(BASE_COLS) + [g for g in gp_names if g in df.columns]
         self.genetic_engine.factor_cols_used = all_cols
-        original_cols = ge_mod.FACTOR_COLS
-        result = None
-        try:
-            ge_mod.FACTOR_COLS = all_cols
-            print(f"\n  遺傳搜索（{len(all_cols)} 個因子）...")
-            result = self.genetic_engine.search(df)
-        finally:
-            ge_mod.FACTOR_COLS = original_cols
+        # S5 Fix：不再修改全域 FACTOR_COLS，search() 已使用 self.factor_cols_used
+        print(f"\n  遺傳搜索（{len(all_cols)} 個因子）...")
+        result = self.genetic_engine.search(df)
 
         if result is not None:
             result["regime"] = regime
+            result["signal_confirm_bars"] = self.monitor.signal_confirm_bars
+            result["confidence_multiplier"] = self.monitor.confidence_multiplier
+            if not result.get("screened_factor_cols"):
+                result["screened_factor_cols"] = list(all_cols)
             # 信號分佈參考（僅打印，不修改狀態）
-            X_raw = df.select([c for c in all_cols if c in df.columns]).to_numpy().astype(np.float64)
+            signal_cols = result.get("screened_factor_cols", all_cols)
+            signal_cols = [c for c in signal_cols if c in df.columns]
+            if not signal_cols:
+                signal_cols = [c for c in all_cols if c in df.columns]
+            X_raw = df.select(signal_cols).to_numpy().astype(np.float64)
             X_raw = np.nan_to_num(X_raw, nan=0.0)
             X_mean = result["factor_mean"]
             X_std = result["factor_std"]
@@ -191,10 +205,11 @@ class BTCBot:
         """Bug 14 Fix：在主線程中原子性地更新共享狀態。"""
         result, regime, all_cols = search_output
         self.current_regime = regime
-        self.active_factor_cols = list(all_cols)
+        effective_cols = result.get("screened_factor_cols") or all_cols
+        self.active_factor_cols = list(effective_cols)
         self.monitor.set_factor(
             result,
-            factor_cols=all_cols,
+            factor_cols=effective_cols,
             interaction_pairs=result.get("interaction_pairs", []),
         )
 
@@ -310,9 +325,18 @@ class BTCBot:
         # 冷卻期
         if self.cooldown_remaining > 0:
             self.cooldown_remaining -= 1
+            # S1 Fix：冷卻期內重置確認計數器，防止非連續K線被當作連續確認
+            self.monitor._confirm_long_count = 0
+            self.monitor._confirm_short_count = 0
 
         # ═══ 計算因子 ═══
         factor_values = self._compute_realtime_factors(candle)
+
+        # S3 Fix：因子計算異常返回空字典時，重置確認計數器，跳過交易邏輯
+        if not factor_values:
+            self.monitor._confirm_long_count = 0
+            self.monitor._confirm_short_count = 0
+            return
 
         # ═══ 生成信號 ═══
         signal = self.monitor.generate_signal(factor_values)
@@ -352,10 +376,10 @@ class BTCBot:
                 close_reason = f"止盈 {pnl_pct:+.4f} (TP={tp_pct:.4f})"
             elif bars_held >= MAX_HOLD_BARS:
                 close_reason = f"超時 {bars_held}根 PnL={pnl_pct:+.4f}"
-            elif self.position == "long" and signal < -short_thr:
-                close_reason = f"信號反轉 sig={signal:+.3f}"
-            elif self.position == "short" and signal > long_thr:
-                close_reason = f"信號反轉 sig={signal:+.3f}"
+            elif self.position in ("long", "short"):
+                pos_dir = 1 if self.position == "long" else -1
+                if self.monitor.should_close_position(signal, pos_dir, long_thr, short_thr):
+                    close_reason = f"信號反轉 sig={signal:+.3f}"
 
             if close_reason:
                 net_pnl = pnl_pct - ROUND_TRIP_FEE
@@ -370,25 +394,24 @@ class BTCBot:
                     self.position = "flat"
                     self.cooldown_remaining = COOLDOWN_BARS
                     self.today_trades += 1
+                    # S1 Fix：平倉時重置確認計數器
+                    self.monitor._confirm_long_count = 0
+                    self.monitor._confirm_short_count = 0
                 else:
                     print(f"  [警告] HL 平倉失敗，保持本地持倉狀態，下根K線重試")
 
         # ═══ 開倉邏輯 ═══
         if self.position == "flat" and self.cooldown_remaining <= 0:
-            open_dir = None
-            open_thr = 0.0
-            if signal > long_thr:
-                open_dir = "long"
-                open_thr = long_thr
-            elif signal < -short_thr:
-                open_dir = "short"
-                open_thr = short_thr
-
-            if open_dir:
+            direction, confirmed = self.monitor.should_open_position(signal, long_thr, short_thr)
+            if confirmed and direction in (1, -1):
+                open_dir = "long" if direction == 1 else "short"
+                open_thr = long_thr if direction == 1 else short_thr
+                conf_thr = open_thr * self.monitor.confidence_multiplier
                 pos_usd = self._calculate_position_size()
                 dir_cn = "多" if open_dir == "long" else "空"
                 print(f"  ★ 開倉 做{dir_cn} @ {close:.1f} 信號={signal:+.3f} "
-                      f"閾值={open_thr:.3f} 倉位=${pos_usd:.0f} [{self.current_regime}]")
+                      f"閾值={open_thr:.3f} 確認閾值={conf_thr:.3f} "
+                      f"({self.monitor.signal_confirm_bars}根確認) 倉位=${pos_usd:.0f} [{self.current_regime}]")
                 hl_result = self._hl_open(open_dir, f"sig={signal:+.3f} thr={open_thr:.3f}")
                 # Bug 16 Fix：只在 HL 成功或無 HL 時才設定本地持倉
                 hl_ok = (self.hl_executor is None) or (hl_result is not None)
@@ -439,192 +462,75 @@ class BTCBot:
             self._retrain_lock = False
 
     def _compute_realtime_factors(self, candle):
-        """從單根 K 線計算因子值（使用滾動窗口）"""
+        """從 K 線緩衝重算最新一根因子，與 factor_engine 保持一致。"""
         if not hasattr(self, '_candle_buffer'):
             self._candle_buffer = []
         self._candle_buffer.append(candle)
-        if len(self._candle_buffer) > 200:
-            self._candle_buffer = self._candle_buffer[-200:]
+        if len(self._candle_buffer) > 300:
+            self._candle_buffer = self._candle_buffer[-300:]
 
-        buf = self._candle_buffer
-        n = len(buf)
-        factor_values = {}
-
-        closes = np.array([c["close"] for c in buf])
-        highs = np.array([c.get("high", c["close"]) for c in buf])
-        lows = np.array([c.get("low", c["close"]) for c in buf])
-        volumes = np.array([c.get("volume", 1.0) for c in buf])
-        opens = np.array([c.get("open", c["close"]) for c in buf])
-        obis = np.array([c.get("obi", 0.0) for c in buf])
-
-        # 動量
-        factor_values["roc5"] = (closes[-1] / closes[-6] - 1) if n > 6 else 0.0
-        factor_values["roc20"] = (closes[-1] / closes[-21] - 1) if n > 21 else 0.0
-        roc5_now = factor_values["roc5"]
-        roc5_prev = (closes[-6] / closes[-11] - 1) if n > 11 else 0.0
-        factor_values["mom_accel"] = roc5_now - roc5_prev
-
-        # 均線偏離
-        if n >= 10:
-            ma10 = closes[-10:].mean()
-            factor_values["ma10dev"] = (closes[-1] - ma10) / (ma10 + 1e-10)
-        else:
-            factor_values["ma10dev"] = 0.0
-        if n >= 30:
-            ma30 = closes[-30:].mean()
-            factor_values["ma30dev"] = (closes[-1] - ma30) / (ma30 + 1e-10)
-            ma10 = closes[-10:].mean()
-            factor_values["ma_alignment"] = (ma10 - ma30) / (ma30 + 1e-10)
-        else:
-            factor_values["ma30dev"] = 0.0
-            factor_values["ma_alignment"] = 0.0
-
-        # VWAP 偏離
-        if n >= 20:
-            vwap = np.sum(closes[-20:] * volumes[-20:]) / (np.sum(volumes[-20:]) + 1e-10)
-            factor_values["vwapdev"] = (closes[-1] - vwap) / (vwap + 1e-10)
-        else:
-            factor_values["vwapdev"] = 0.0
-
-        # 波動率因子
-        if n >= 20:
-            std20 = closes[-20:].std()
-            std5 = closes[-5:].std() if n >= 5 else std20
-            factor_values["vol_ratio"] = std5 / (std20 + 1e-10)
-            bb_mid = closes[-20:].mean()
-            factor_values["bb_pctb"] = (closes[-1] - (bb_mid - 2*std20)) / (4*std20 + 1e-10)
-            tr_arr = highs[-20:] - lows[-20:]
-            tr_mean = tr_arr.mean()
-            factor_values["tr_ratio"] = (highs[-1] - lows[-1]) / (tr_mean + 1e-10)
-        else:
-            factor_values["vol_ratio"] = 1.0
-            factor_values["bb_pctb"] = 0.5
-            factor_values["tr_ratio"] = 1.0
-
-        # 成交量因子
-        if n >= 20:
-            vol_ma20 = volumes[-20:].mean()
-            factor_values["vol_surge"] = volumes[-1] / (vol_ma20 + 1e-10)
-            ret1 = (closes[-1] / closes[-2] - 1) if n >= 2 else 0.0
-            factor_values["vol_price_div"] = np.sign(ret1) * (1 - volumes[-1] / (vol_ma20 + 1e-10))
-        else:
-            factor_values["vol_surge"] = 1.0
-            factor_values["vol_price_div"] = 0.0
-
-        # OBV 斜率
-        if n >= 6:
-            obv_deltas = np.sign(np.diff(closes[-6:])) * volumes[-5:]
-            factor_values["obv_slope"] = obv_deltas.sum() / (volumes[-5:].sum() + 1e-10)
-        else:
-            factor_values["obv_slope"] = 0.0
-
-        # 價格衝擊
-        if n >= 2:
-            ret1 = closes[-1] / closes[-2] - 1
-            vol_ma = volumes[-20:].mean() if n >= 20 else volumes.mean()
-            factor_values["priceimpact"] = ret1 * volumes[-1] / (vol_ma + 1e-10)
-        else:
-            factor_values["priceimpact"] = 0.0
-
-        # MACD（Bug 18 Fix：增量 EMA 避免 O(n²)，先算完整 EMA 陣列再取值）
-        if n >= 26:
-            ema12_arr = self._ewm_full(closes, 12)
-            ema26_arr = self._ewm_full(closes, 26)
-            macd_arr = ema12_arr - ema26_arr
-            # 信號線：對 MACD 序列做 9 期 EMA
-            macd_signal_arr = self._ewm_full(macd_arr, 9)
-            factor_values["macdhist"] = float(macd_arr[-1] - macd_signal_arr[-1])
-        else:
-            factor_values["macdhist"] = 0.0
-
-        # RSI（標準化到 [-0.5, 0.5]）
-        if n >= 15:
-            rets = np.diff(closes[-15:])
-            gains = rets[rets > 0].mean() if (rets > 0).any() else 0.0
-            losses = (-rets[rets < 0]).mean() if (rets < 0).any() else 0.0
-            factor_values["rsi_norm"] = gains / (gains + losses + 1e-10) - 0.5
-        else:
-            factor_values["rsi_norm"] = 0.0
-
-        # K 線方向
-        factor_values["candle_dir"] = (closes[-1] - opens[-1]) / (highs[-1] - lows[-1] + 1e-10)
-
-        # OBI 因子
-        factor_values["obi"] = obis[-1] if n > 0 else 0.0
-        if n >= 6:
-            factor_values["obi_momentum"] = obis[-1] - obis[-6]
-        else:
-            factor_values["obi_momentum"] = 0.0
-        if n >= 10:
-            factor_values["obi_ma"] = obis[-10:].mean()
-        else:
-            factor_values["obi_ma"] = 0.0
-
-        # 時間因子
-        ts = candle.get("timestamp", 0)
-        if isinstance(ts, (int, float)) and ts > 1e9:
-            hour_rad = 2 * 3.14159 * ((ts / 1000) % 86400) / 86400
-            factor_values["hour_sin"] = np.sin(hour_rad)
-            factor_values["hour_cos"] = np.cos(hour_rad)
-        else:
-            factor_values["hour_sin"] = 0.0
-            factor_values["hour_cos"] = 0.0
-
-        # 持倉量因子（如果有）
-        factor_values.setdefault("oi_roc6", 0.0)
-        factor_values.setdefault("oi_roc24", 0.0)
-        factor_values.setdefault("price_oi_confirm", 0.0)
-
-        # GP 因子
-        # Bug 6 Fix：從完整的 K 線 buffer 重建所有因子時序，而非用零陣列填充
-        if hasattr(self, 'gp_miner') and self._candle_buffer and n >= 30:
+        def _to_float(value, default=0.0):
             try:
-                # 用 buffer 中的歷史數據構建完整的因子時序
-                buf_factor_data = {
-                    "roc5":        np.array([(closes[i] / closes[i-5] - 1) if i >= 5 else 0.0 for i in range(n)]),
-                    "roc20":       np.array([(closes[i] / closes[i-20] - 1) if i >= 20 else 0.0 for i in range(n)]),
-                    "ma10dev":     np.array([(closes[i] - closes[max(0,i-10):i+1].mean()) /
-                                             (closes[max(0,i-10):i+1].mean() + 1e-10) if i >= 9 else 0.0 for i in range(n)]),
-                    "ma30dev":     np.array([(closes[i] - closes[max(0,i-30):i+1].mean()) /
-                                             (closes[max(0,i-30):i+1].mean() + 1e-10) if i >= 29 else 0.0 for i in range(n)]),
-                    "vwapdev":     np.array([(closes[i] - np.sum(closes[max(0,i-20):i+1]*volumes[max(0,i-20):i+1]) /
-                                             (np.sum(volumes[max(0,i-20):i+1]) + 1e-10)) /
-                                            (np.sum(closes[max(0,i-20):i+1]*volumes[max(0,i-20):i+1]) /
-                                             (np.sum(volumes[max(0,i-20):i+1]) + 1e-10) + 1e-10)
-                                            if i >= 19 else 0.0 for i in range(n)]),
-                    "priceimpact": np.array([(closes[i]/closes[i-1]-1)*volumes[i]/(volumes[max(0,i-20):i+1].mean()+1e-10)
-                                             if i >= 1 else 0.0 for i in range(n)]),
-                    "vol_ratio":   np.array([closes[max(0,i-5):i+1].std()/(closes[max(0,i-20):i+1].std()+1e-10)
-                                             if i >= 19 else 1.0 for i in range(n)]),
-                    "vol_surge":   np.array([volumes[i]/(volumes[max(0,i-20):i+1].mean()+1e-10) if i >= 19 else 1.0 for i in range(n)]),
-                    "candle_dir":  (closes - opens) / (highs - lows + 1e-10),
-                    "rsi_norm":    np.zeros(n),  # 近似值，保留結構
-                    "macdhist":    np.zeros(n),
-                    "bb_pctb":     np.zeros(n),
-                    "obv_slope":   np.zeros(n),
-                }
-                # RSI 近似
-                if n >= 14:
-                    rets = np.diff(closes)
-                    for i in range(14, n):
-                        w = rets[i-14:i]
-                        g = w[w>0].mean() if (w>0).any() else 0.0
-                        l = (-w[w<0]).mean() if (w<0).any() else 0.0
-                        buf_factor_data["rsi_norm"][i] = g/(g+l+1e-10) - 0.5
-
-                for fname in self.gp_miner.get_factor_names():
-                    for f in self.gp_miner.discovered_factors:
-                        if f["name"] == fname:
-                            try:
-                                vals = f["tree"].evaluate(buf_factor_data)
-                                factor_values[fname] = float(vals[-1])
-                            except Exception:
-                                factor_values[fname] = 0.0
-                            break
+                if value is None:
+                    return float(default)
+                return float(value)
             except Exception:
-                pass
+                return float(default)
 
-        return factor_values
+        try:
+            rows = []
+            for item in self._candle_buffer:
+                close_v = _to_float(item.get("close", 0.0))
+                rows.append({
+                    "timestamp": _to_float(item.get("timestamp", 0.0)),
+                    "open": _to_float(item.get("open", close_v), close_v),
+                    "high": _to_float(item.get("high", close_v), close_v),
+                    "low": _to_float(item.get("low", close_v), close_v),
+                    "close": close_v,
+                    "volume": _to_float(item.get("volume", 0.0), 0.0),
+                    "obi": _to_float(item.get("obi", 0.0), 0.0),
+                    "spread": _to_float(item.get("spread", 0.0), 0.0),
+                    "bid_vol": _to_float(item.get("bid_vol", 0.0), 0.0),
+                    "ask_vol": _to_float(item.get("ask_vol", 0.0), 0.0),
+                })
+
+            buf_df = pl.DataFrame(rows)
+            if buf_df.height == 0:
+                return {}
+
+            factor_df = compute_factors(buf_df, oi_df=None)
+            last = factor_df.tail(1).to_dicts()[0]
+
+            factor_values = {}
+            for k, v in last.items():
+                if isinstance(v, (int, float, np.integer, np.floating)):
+                    fv = float(v)
+                    factor_values[k] = fv if np.isfinite(fv) else 0.0
+
+            # 沒有 OI 檔時，保底欄位為 0
+            factor_values.setdefault("oi_roc6", 0.0)
+            factor_values.setdefault("oi_roc24", 0.0)
+            factor_values.setdefault("price_oi_confirm", 0.0)
+
+            # GP 因子：基於完整因子時序計算最新值
+            if hasattr(self, 'gp_miner') and factor_df.height >= 30:
+                factor_data = {}
+                for col in factor_df.columns:
+                    try:
+                        arr = factor_df[col].to_numpy().astype(np.float64)
+                        factor_data[col] = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                    except Exception:
+                        pass
+                gp_data = self.gp_miner.compute_gp_factors(factor_data)
+                for name, values in gp_data.items():
+                    if len(values) > 0:
+                        fv = float(values[-1])
+                        factor_values[name] = fv if np.isfinite(fv) else 0.0
+
+            return factor_values
+        except Exception as e:
+            print(f"  即時因子計算異常: {e}")
+            return {}
 
     def _ewm(self, arr, span):
         """計算 EWM（指數加權移動平均），返回最終純量值。"""
@@ -656,7 +562,7 @@ class BTCBot:
 
     async def run(self):
         print("\n" + "=" * 60)
-        print("BTC-Bot 啟動（v5.0 — 全面升級版）")
+        print("BTC-Bot 啟動（v6.0 — 勝率極致優化版）")
         print(f"  基礎因子: {len(FACTOR_COLS)} 個")
         print(f"  GP 因子: {len(self.gp_miner.discovered_factors)} 個")
         print(f"  活躍因子: {len(self.active_factor_cols)} 個")
@@ -676,6 +582,8 @@ class BTCBot:
         print(f"  ═══ 閾值策略 ═══")
         print(f"  預熱: 前 {DYNAMIC_THRESHOLD_WARMUP} 根K線用搜索閾值80%")
         print(f"  目標觸發率: {TARGET_TRADE_PCT*100:.0f}%")
+        print(f"  信號確認: {self.monitor.signal_confirm_bars} 根同向")
+        print(f"  置信度過濾: {self.monitor.confidence_multiplier:.2f}x 閾值")
         print(f"  信號 Debug: {'開啟' if SIGNAL_DEBUG else '關閉'} (每{SIGNAL_DEBUG_INTERVAL}根K線)")
         print("=" * 60)
 
