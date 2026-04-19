@@ -1,0 +1,2 @@
+nohup: ignoring input
+python: can't open file '/root/btc-bot/tools/expression_miner_v2.py': [Errno 2] No such file or directory

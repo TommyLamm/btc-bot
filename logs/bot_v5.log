@@ -1,0 +1,173 @@
+Traceback (most recent call last):
+  File "/root/btc-bot/main.py", line 619, in <module>
+    bot = BTCBot()
+          ^^^^^^^^
+  File "/root/btc-bot/main.py", line 63, in __init__
+    self.feed = BTCRealtimeFeed(callback=self.on_candle_close)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: BTCRealtimeFeed.__init__() got an unexpected keyword argument 'callback'
+  載入 25 個 GP 因子
+
+  GP 因子挖掘開始（種群=300, 代數=50, 深度≤5）
+    第  10 代 | IC=0.0562 IR=2.12 fit=42.3 | log1p((neg(ma30dev) - shift(tanh(ewm(ma30dev, 20))
+    第  20 代 | IC=0.0562 IR=2.36 fit=47.9 | log1p((neg(ma30dev) - shift(ewm(roc20, 30), 10)))
+    第  30 代 | IC=0.0562 IR=2.36 fit=47.9 | log1p((neg(ma30dev) - shift(ewm(roc20, 30), 10)))
+    第  40 代 | IC=0.0562 IR=2.36 fit=47.9 | log1p((neg(ma30dev) - shift(ewm(roc20, 30), 10)))
+    第  50 代 | IC=0.0562 IR=2.36 fit=47.9 | log1p((neg(ma30dev) - shift(ewm(roc20, 30), 10)))
+    新因子: gp_04121901_0 | IC=0.0311 IR=1.28 | log1p(((-0.72 * shift(log1p(oi_roc24), 10)) - ma30dev))
+    新因子: gp_04121901_1 | IC=0.0457 IR=1.17 | (diff(ma30dev, 20) - (roc20 - rolling_std(neg(mom_accel), 30
+    新因子: gp_04121901_2 | IC=0.0410 IR=0.98 | neg(tanh(max(square(square(bb_pctb)), bb_pctb)))
+    新因子: gp_04121901_3 | IC=0.0413 IR=0.95 | neg(tanh(max(square(square(bb_pctb)), roc5)))
+    新因子: gp_04121901_4 | IC=0.0334 IR=0.75 | (neg(log1p(ma10dev)) - rolling_mean(ewm(rolling_rank(ma30dev
+  GP 挖掘完成，發現 5 個新因子，因子庫共 25 個
+
+  遺傳搜索（47 個因子）...
+  因子: 47 基礎 + 10 交互 = 57 總計
+  數據分割: 訓練=2400 驗證1=800 驗證2=800
+  手續費: 每筆 0.070% (雙邊)
+  第  10 代 | 訓練 WR=0.528 PF=1.80 交易=   53 多空=42%/58% DD=0.0069 | 最佳綜合=-34.65
+  第  20 代 | 訓練 WR=0.528 PF=1.80 交易=   53 多空=42%/58% DD=0.0069 | 最佳綜合=-20.75
+  第 27 代早停
+
+  最優因子權重（47 基礎 + 10 交互）:
+    roc5                   +0.157
+    roc20                  -0.138
+    vwapdev                +0.283
+    priceimpact            +0.066
+    macdhist               -0.197
+    rsi_norm               -0.061
+    bb_pctb                -0.211
+    vol_ratio              +0.128
+    vol_price_div          -0.157
+    price_oi_confirm       +0.143
+    hour_sin               +0.338
+    gp_04121848_2          -0.059
+    gp_04121848_3          -0.082
+    gp_04121901_0          -0.078
+    gp_04121901_1          +0.101
+    gp_04121901_2          -0.164
+    gp_04121901_4          -0.120
+    gp_04121421_0          +0.119
+    gp_04121421_1          +0.303
+    gp_04120751_0          -0.389
+    gp_04120751_3          -0.378
+    gp_04121227_1          -0.240
+    gp_04121447_1          +0.105
+    gp_04121447_2          +0.081
+    tr_ratio×hour_cos      -0.202
+    tr_ratio×macdhist      -0.068
+    hour_sin×vol_price_div +0.062
+
+  訓練集: WR=0.399 PF=1.13 交易=138 多空=46%/54%
+  驗證1:  WR=0.397 PF=0.55 交易=58 DD=0.0304
+  驗證2:  WR=0.426 PF=0.80 交易=47 DD=0.0199
+  多頭閾值: 0.9549
+  空頭閾值: 1.0712
+
+  ⚠️ 警告: 驗證集平均 PF=0.68 < 1.0（扣費後虧損）
+  因子已更新，多頭閾值=0.955 空頭閾值=1.071 [trending]
+  信號分佈: P50=0.348 P90=0.765 Max=8.110
+  多頭信號: P50=0.352 P90=0.752
+  空頭信號: P50=0.343 P90=0.786
+  搜索完成（市場狀態=trending）
+
+============================================================
+BTC-Bot 啟動（v5.0 — 全面升級版）
+  基礎因子: 22 個
+  GP 因子: 25 個
+  活躍因子: 47 個
+  市場狀態: trending
+  交易模式: 純信號（未啟用實盤）
+  ═══ 動態倉位 ═══
+  基礎保證金: $200.0 (範圍 $50.0~$350.0)
+  目標每筆盈利: $2.0
+  ═══ 風控參數 ═══
+  止損: 1.0×ATR | 止盈: 3.0×ATR (風險回報比 1:3)
+  最大持倉: 20 根K線 (100分鐘)
+  ═══ 閾值策略 ═══
+  預熱: 前 10 根K線用搜索閾值80%
+  目標觸發率: 12%
+  信號 Debug: 開啟 (每3根K線)
+============================================================
+WebSocket 連接中...
+已連接，開始接收數據
+K線收盤 19:00 | close=71111.4 | OBI=+0.755
+  ★ 開倉 做空 @ 71111.4 信號=-30.065 閾值=0.857 倉位=$350 [trending]
+K線收盤 19:05 | close=71107.0 | OBI=-0.988
+K線收盤 19:10 | close=71100.0 | OBI=-0.280
+  [信號] sig=-30.0790 L閾=0.7639 S閾=0.8570 [預熱(3/10)] → short
+K線收盤 19:15 | close=71104.9 | OBI=+0.477
+K線收盤 19:20 | close=71117.8 | OBI=+0.648
+K線收盤 19:25 | close=71125.0 | OBI=+0.526
+  [信號] sig=-30.0442 L閾=0.7639 S閾=0.8570 [預熱(6/10)] → short
+K線收盤 19:30 | close=71130.1 | OBI=+0.822
+K線收盤 19:35 | close=71082.8 | OBI=+0.974
+K線收盤 19:40 | close=71071.9 | OBI=-0.522
+  [信號] sig=-30.0695 L閾=0.7639 S閾=0.8570 [預熱(9/10)] → short
+K線收盤 19:45 | close=71083.7 | OBI=-0.440
+K線收盤 19:50 | close=71090.2 | OBI=+0.441
+K線收盤 19:55 | close=71055.2 | OBI=+0.295
+  [信號] sig=-30.1075 L閾=0.9549 S閾=1.5000 [動態] → short
+K線收盤 20:00 | close=71043.5 | OBI=+0.415
+K線收盤 20:05 | close=70969.4 | OBI=+0.904
+  平倉 short @ 70969.4 止盈 +0.0020 (TP=0.0010)
+K線收盤 20:10 | close=70982.2 | OBI=+0.315
+  [信號] sig=-29.9858 L閾=0.9549 S閾=1.5000 [動態] → short
+  ★ 開倉 做空 @ 70982.2 信號=-29.986 閾值=1.500 倉位=$350 [trending]
+K線收盤 20:15 | close=70990.1 | OBI=+0.342
+K線收盤 20:20 | close=71022.9 | OBI=+0.576
+K線收盤 20:25 | close=71024.7 | OBI=-0.858
+  [信號] sig=-29.9465 L閾=0.9549 S閾=1.5000 [動態] → short
+  平倉 short @ 71024.7 止損 -0.0006 (SL=0.0006)
+K線收盤 20:30 | close=71114.7 | OBI=+0.973
+  ★ 開倉 做空 @ 71114.7 信號=-29.885 閾值=1.500 倉位=$350 [trending]
+K線收盤 20:35 | close=71117.9 | OBI=-0.425
+  監控: WR=0.500 (2/200) 淨PnL=-0.0000 PF=1.00 正常 L閾=0.955 S閾=1.500 信號=20根 多空=0%/100% 連虧=1
+  市場: trending (趨勢100% 震盪0% 高波動0%)
+K線收盤 20:40 | close=71284.0 | OBI=+0.434
+  [信號] sig=-30.2391 L閾=0.9549 S閾=1.5000 [動態] → short
+  平倉 short @ 71284.0 止損 -0.0024 (SL=0.0009)
+K線收盤 20:45 | close=71205.4 | OBI=-0.484
+  ★ 開倉 做空 @ 71205.4 信號=-30.631 閾值=1.500 倉位=$137 [trending]
+K線收盤 20:50 | close=71281.1 | OBI=-0.691
+  平倉 short @ 71281.1 止損 -0.0011 (SL=0.0010)
+K線收盤 20:55 | close=71302.9 | OBI=-0.384
+  [信號] sig=-30.1536 L閾=0.9549 S閾=1.5000 [動態] → short
+  ★ 開倉 做空 @ 71302.9 信號=-30.154 閾值=1.500 倉位=$128 [trending]
+K線收盤 21:00 | close=71370.1 | OBI=+0.035
+K線收盤 21:05 | close=71274.7 | OBI=-0.550
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:10 | close=71179.2 | OBI=+0.956
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:15 | close=71266.1 | OBI=+0.409
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:20 | close=71279.2 | OBI=+0.945
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:25 | close=71268.8 | OBI=+0.297
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:30 | close=71201.2 | OBI=-0.981
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:35 | close=71286.1 | OBI=-0.901
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:40 | close=71277.8 | OBI=+0.877
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:45 | close=71179.1 | OBI=-1.000
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:50 | close=71176.8 | OBI=-0.271
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 21:55 | close=71331.7 | OBI=-0.153
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據
+K線收盤 22:00 | close=70729.3 | OBI=+0.999
+WebSocket 錯誤: object of type 'numpy.float64' has no len()，10 秒後重連...
+已連接，開始接收數據

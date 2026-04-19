@@ -1,0 +1,621 @@
+"""
+BTC-Bot v5.0 — 全面升級版
+改進：
+  1. 25+ 因子（波動率、成交量、微觀結構、時間、交互項）
+  2. 分離多空閾值 + 預熱期用搜索閾值 80%
+  3. 動態倉位（交易量少加大、多縮小）+ 目標每筆 $2
+  4. 止損 1.0×ATR / 止盈 3.0×ATR（風險回報比 1:3）
+  5. Walk-forward 驗證 + 非線性交互項
+  6. 自適應止損（根據波動率調整）
+"""
+
+import asyncio
+import os
+import sys
+import numpy as np
+import polars as pl
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from data.realtime_feed import BTCRealtimeFeed
+from factors.factor_engine import compute_factors
+from factors.regime_detector import RegimeDetector
+from engine.gp_factor_miner import GPFactorMiner
+from engine.genetic_engine import GeneticEngine, FACTOR_COLS, ROUND_TRIP_FEE
+from monitor.performance_monitor import PerformanceMonitor
+
+# ═══ 交易參數 ═══
+HL_ENABLED = os.environ.get("HL_ENABLED", "true").lower() == "true"
+HL_SECRET = os.environ.get("HL_SECRET", "")
+HL_ACCOUNT = os.environ.get("HL_ACCOUNT", "")
+HL_LEVERAGE = int(os.environ.get("HL_LEVERAGE", "3"))
+HL_ACCOUNT_SIZE = float(os.environ.get("HL_ACCOUNT_SIZE", "400"))
+
+# ═══ 動態倉位 ═══
+TARGET_PROFIT_PER_TRADE = float(os.environ.get("TARGET_PROFIT", "2.0"))
+BASE_POSITION_USD = float(os.environ.get("BASE_POSITION_USD", "200"))
+MIN_POSITION_USD = float(os.environ.get("MIN_POSITION_USD", "50"))
+MAX_POSITION_USD = float(os.environ.get("MAX_POSITION_USD", "350"))
+LOW_FREQ_THRESHOLD = int(os.environ.get("LOW_FREQ_THRESHOLD", "15"))
+HIGH_FREQ_THRESHOLD = int(os.environ.get("HIGH_FREQ_THRESHOLD", "40"))
+
+# ═══ 風控參數 ═══
+STOP_LOSS_ATR_MULT = float(os.environ.get("SL_ATR", "1.0"))
+TAKE_PROFIT_ATR_MULT = float(os.environ.get("TP_ATR", "3.0"))
+MAX_HOLD_BARS = int(os.environ.get("MAX_HOLD_BARS", "20"))
+COOLDOWN_BARS = int(os.environ.get("COOLDOWN_BARS", "1"))
+
+# ═══ 閾值參數 ═══
+TARGET_TRADE_PCT = float(os.environ.get("TARGET_TRADE_PCT", "0.12"))
+DYNAMIC_THRESHOLD_WARMUP = int(os.environ.get("DYNAMIC_THRESHOLD_WARMUP", "10"))
+SIGNAL_DEBUG = os.environ.get("SIGNAL_DEBUG", "true").lower() == "true"
+SIGNAL_DEBUG_INTERVAL = int(os.environ.get("SIGNAL_DEBUG_INTERVAL", "3"))
+
+# ═══ 數據參數 ═══
+DATA_PATH = "data/btc_5m.parquet"
+OI_PATH = "data/btc_oi.parquet"
+HISTORY_BARS = 4000
+
+
+class BTCBot:
+    def __init__(self):
+        self.feed = BTCRealtimeFeed(callback=self.on_candle_close)
+        self.regime_detector = RegimeDetector()
+        self.gp_miner = GPFactorMiner(
+            pop_size=300, n_generations=50, max_depth=5,
+            ic_threshold=0.02, max_new_factors=5,
+            max_correlation=0.7,
+        )
+        self.genetic_engine = GeneticEngine(
+            pop_size=300, n_generations=60,
+            threshold_range=(0.05, 1.2),
+            fee_rate=ROUND_TRIP_FEE,
+            n_interactions=10,
+        )
+        self.monitor = PerformanceMonitor(window_size=200, retrain_threshold=0.40)
+
+        self.current_regime = "unknown"
+        self.active_factor_cols = list(FACTOR_COLS)
+        self.candle_count = 0
+        self.position = "flat"
+        self.entry_price = 0.0
+        self.entry_bar = 0
+        self.entry_atr = 0.0
+        self.cooldown_remaining = 0
+        self.last_close = 0.0
+        self.current_atr = 0.0
+        self.today_trades = 0
+        self.today_start_bar = 0
+        self.current_position_usd = BASE_POSITION_USD
+
+        # Hyperliquid
+        self.hl_executor = None
+        if HL_ENABLED and HL_SECRET and HL_ACCOUNT:
+            try:
+                from executor.hyperliquid_executor import HyperliquidExecutor
+                self.hl_executor = HyperliquidExecutor(
+                    secret_key=HL_SECRET,
+                    account_address=HL_ACCOUNT,
+                    leverage=HL_LEVERAGE,
+                    default_position_size_usd=BASE_POSITION_USD,
+                    coin="BTC",
+                    log_path="logs/trades_v5.jsonl",
+                )
+                print(f"  Hyperliquid 已連接: {HL_LEVERAGE}x 槓桿")
+            except Exception as e:
+                print(f"  Hyperliquid 初始化失敗: {e}")
+
+        # 初始搜索
+        self._run_adaptive_search()
+
+    def _run_adaptive_search(self):
+        """執行因子挖掘 + 遺傳搜索"""
+        if not os.path.exists(DATA_PATH):
+            print("  歷史數據不存在，跳過搜索")
+            return
+
+        df = pl.read_parquet(DATA_PATH).tail(HISTORY_BARS)
+        oi_df = None
+        if os.path.exists(OI_PATH):
+            oi_df = pl.read_parquet(OI_PATH)
+
+        df = compute_factors(df, oi_df)
+
+        # 市場狀態
+        close = df["close"].to_numpy().astype(np.float64)
+        high = df["high"].to_numpy().astype(np.float64) if "high" in df.columns else close
+        low = df["low"].to_numpy().astype(np.float64) if "low" in df.columns else close
+        regime_result = self.regime_detector.detect(high, low, close)
+        self.current_regime = regime_result["regime"]
+
+        # GP 因子挖掘
+        ret = np.zeros(len(close))
+        ret[:-1] = (close[1:] - close[:-1]) / close[:-1]
+        factor_data = {}
+        for col in df.columns:
+            try:
+                factor_data[col] = df[col].to_numpy().astype(np.float64)
+            except Exception:
+                pass
+        gp_factors = self.gp_miner.mine(factor_data, ret)
+
+        # 將 GP 因子加入 DataFrame
+        gp_data = self.gp_miner.compute_gp_factors(factor_data)
+        for name, values in gp_data.items():
+            if len(values) == len(df):
+                df = df.with_columns(pl.Series(name=name, values=values))
+
+        # 更新因子列表
+        gp_names = self.gp_miner.get_factor_names()
+        self.active_factor_cols = list(FACTOR_COLS) + [g for g in gp_names if g in df.columns]
+
+        # 更新遺傳搜索的因子列表
+        from engine.genetic_engine import FACTOR_COLS as BASE_COLS
+        all_cols = list(BASE_COLS) + [g for g in gp_names if g in df.columns]
+        self.genetic_engine.factor_cols_used = all_cols
+
+        # 暫時替換 FACTOR_COLS
+        import engine.genetic_engine as ge_mod
+        original_cols = ge_mod.FACTOR_COLS
+        ge_mod.FACTOR_COLS = all_cols
+
+        # 遺傳搜索
+        print(f"\n  遺傳搜索（{len(all_cols)} 個因子）...")
+        result = self.genetic_engine.search(df)
+
+        ge_mod.FACTOR_COLS = original_cols
+
+        if result is not None:
+            result["regime"] = self.current_regime
+            self.monitor.set_factor(
+                result,
+                factor_cols=all_cols,
+                interaction_pairs=result.get("interaction_pairs", []),
+            )
+
+            # 信號分佈參考
+            X_raw = df.select([c for c in all_cols if c in df.columns]).to_numpy().astype(np.float64)
+            X_raw = np.nan_to_num(X_raw, nan=0.0)
+            X_mean = result["factor_mean"]
+            X_std = result["factor_std"]
+            n_base = min(X_raw.shape[1], len(X_mean))
+            X = (X_raw[:, :n_base] - X_mean[:n_base]) / (X_std[:n_base] + 1e-10)
+            signals = X @ result["weights"][:n_base]
+            abs_sig = np.abs(signals)
+            pos_sig = signals[signals > 0]
+            neg_sig = np.abs(signals[signals < 0])
+            print(f"  信號分佈: P50={np.percentile(abs_sig,50):.3f} "
+                  f"P90={np.percentile(abs_sig,90):.3f} Max={abs_sig.max():.3f}")
+            if len(pos_sig) > 0:
+                print(f"  多頭信號: P50={np.percentile(pos_sig,50):.3f} P90={np.percentile(pos_sig,90):.3f}")
+            if len(neg_sig) > 0:
+                print(f"  空頭信號: P50={np.percentile(neg_sig,50):.3f} P90={np.percentile(neg_sig,90):.3f}")
+
+        print(f"  搜索完成（市場狀態={self.current_regime}）")
+
+    def _compute_atr(self, high, low, close, period=14):
+        """計算 ATR"""
+        tr = max(high - low, abs(high - close), abs(low - close))
+        if self.current_atr == 0:
+            self.current_atr = tr
+        else:
+            self.current_atr = (self.current_atr * (period - 1) + tr) / period
+        return self.current_atr
+
+    def _calculate_position_size(self):
+        """動態倉位計算"""
+        # 基礎倉位：根據 ATR 和目標盈利反算
+        if self.current_atr > 0 and self.last_close > 0:
+            tp_price_move = self.current_atr * TAKE_PROFIT_ATR_MULT
+            btc_needed = TARGET_PROFIT_PER_TRADE / tp_price_move
+            notional_needed = btc_needed * self.last_close
+            base_margin = notional_needed / HL_LEVERAGE
+        else:
+            base_margin = BASE_POSITION_USD
+
+        # 交易頻率調節
+        bars_today = self.candle_count - self.today_start_bar
+        if bars_today > 0:
+            trades_per_day_est = self.today_trades * (288 / bars_today)
+        else:
+            trades_per_day_est = 0
+
+        freq_multiplier = 1.0
+        if trades_per_day_est < LOW_FREQ_THRESHOLD and bars_today > 20:
+            freq_multiplier = 1.3
+        elif trades_per_day_est > HIGH_FREQ_THRESHOLD:
+            freq_multiplier = 0.6
+
+        # 勝率調節
+        stats = self.monitor.get_stats()
+        wr = stats.get("win_rate", 0.5)
+        wr_multiplier = 1.0
+        if stats["n_trades"] >= 20:
+            if wr > 0.58:
+                wr_multiplier = 1.2
+            elif wr < 0.38:
+                wr_multiplier = 0.5
+
+        position_usd = base_margin * freq_multiplier * wr_multiplier
+        position_usd = max(MIN_POSITION_USD, min(MAX_POSITION_USD, position_usd))
+        self.current_position_usd = round(position_usd, 2)
+        return self.current_position_usd
+
+    def _hl_open(self, direction, reason=""):
+        """Hyperliquid 開倉"""
+        if not self.hl_executor:
+            return None
+        try:
+            position_usd = self._calculate_position_size()
+            self.hl_executor.default_position_size_usd = position_usd
+            if direction == "long":
+                result = self.hl_executor.open_long(reason)
+            else:
+                result = self.hl_executor.open_short(reason)
+            if result and result.get("status") == "ok":
+                return result
+            else:
+                err = result.get("error", "unknown") if result else "no result"
+                print(f"  [HL] 開倉失敗: {err}")
+                return None
+        except Exception as e:
+            print(f"  [HL] 開倉異常: {e}")
+            return None
+
+    def _hl_close(self, reason=""):
+        """Hyperliquid 平倉"""
+        if not self.hl_executor:
+            return None
+        try:
+            result = self.hl_executor.close_position(reason)
+            if result and result.get("status") == "ok":
+                return result
+            elif result and "no position" in str(result.get("error", "")):
+                return result
+            else:
+                err = result.get("error", "unknown") if result else "no result"
+                print(f"  [HL] 平倉失敗: {err}")
+                return None
+        except Exception as e:
+            print(f"  [HL] 平倉異常: {e}")
+            return None
+
+    async def on_candle_close(self, candle):
+        self.candle_count += 1
+        close = candle["close"]
+        high = candle.get("high", close)
+        low = candle.get("low", close)
+        obi = candle.get("obi", 0.0)
+        self.last_close = close
+
+        # 計算 ATR
+        atr = self._compute_atr(high, low, close)
+
+        # 每日重置
+        if self.candle_count % 288 == 1:
+            self.today_trades = 0
+            self.today_start_bar = self.candle_count
+
+        # 冷卻期
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+
+        ts = candle.get("timestamp", "")
+        if isinstance(ts, (int, float)):
+            ts = datetime.fromtimestamp(ts / 1000).strftime("%H:%M") if ts > 1e9 else str(ts)
+        print(f"K線收盤  {ts}  | close={close:.1f} | OBI={obi:+.3f}")
+
+        # ═══ 計算因子 ═══
+        factor_values = self._compute_realtime_factors(candle)
+
+        # ═══ 生成信號 ═══
+        signal = self.monitor.generate_signal(factor_values)
+
+        # ═══ 取得閾值 ═══
+        long_thr, short_thr, is_warmup = self.monitor.get_thresholds(
+            target_trade_pct=TARGET_TRADE_PCT,
+            warmup=DYNAMIC_THRESHOLD_WARMUP,
+        )
+
+        # ═══ 信號 Debug ═══
+        if SIGNAL_DEBUG and self.candle_count % SIGNAL_DEBUG_INTERVAL == 0:
+            warmup_str = f"預熱({len(self.monitor.realtime_signal_buffer)}/{DYNAMIC_THRESHOLD_WARMUP})" if is_warmup else "動態"
+            if signal > long_thr:
+                action_str = "→ long"
+            elif signal < -short_thr:
+                action_str = "→ short"
+            else:
+                action_str = "→ hold"
+            print(f"  [信號] sig={signal:+.4f} L閾={long_thr:.4f} S閾={short_thr:.4f} "
+                  f"[{warmup_str}] {action_str}")
+
+        # ═══ 持倉管理 ═══
+        if self.position != "flat":
+            bars_held = self.candle_count - self.entry_bar
+            pnl_pct = self._calculate_pnl(close)
+
+            # 止損（自適應：高波動時放寬）
+            vol_adj = max(0.8, min(1.5, atr / (self.entry_atr + 1e-10)))
+            sl_pct = (self.entry_atr * STOP_LOSS_ATR_MULT * vol_adj) / self.entry_price
+            tp_pct = (self.entry_atr * TAKE_PROFIT_ATR_MULT) / self.entry_price
+
+            close_reason = None
+            if pnl_pct <= -sl_pct:
+                close_reason = f"止損 {pnl_pct:+.4f} (SL={sl_pct:.4f})"
+            elif pnl_pct >= tp_pct:
+                close_reason = f"止盈 {pnl_pct:+.4f} (TP={tp_pct:.4f})"
+            elif bars_held >= MAX_HOLD_BARS:
+                close_reason = f"超時 {bars_held}根 PnL={pnl_pct:+.4f}"
+            elif self.position == "long" and signal < -short_thr:
+                close_reason = f"信號反轉 sig={signal:+.3f}"
+            elif self.position == "short" and signal > long_thr:
+                close_reason = f"信號反轉 sig={signal:+.3f}"
+
+            if close_reason:
+                net_pnl = pnl_pct - ROUND_TRIP_FEE
+                self.monitor.record_trade(net_pnl)
+                print(f"  平倉 {self.position} @ {close:.1f} {close_reason}")
+                self._hl_close(close_reason)
+                self.position = "flat"
+                self.cooldown_remaining = COOLDOWN_BARS
+                self.today_trades += 1
+
+        # ═══ 開倉邏輯 ═══
+        if self.position == "flat" and self.cooldown_remaining <= 0:
+            if signal > long_thr:
+                self.position = "long"
+                self.entry_price = close
+                self.entry_bar = self.candle_count
+                self.entry_atr = atr
+                pos_usd = self._calculate_position_size()
+                print(f"  ★ 開倉 做多 @ {close:.1f} 信號={signal:+.3f} "
+                      f"閾值={long_thr:.3f} 倉位=${pos_usd:.0f} [{self.current_regime}]")
+                self._hl_open("long", f"sig={signal:+.3f} thr={long_thr:.3f}")
+            elif signal < -short_thr:
+                self.position = "short"
+                self.entry_price = close
+                self.entry_bar = self.candle_count
+                self.entry_atr = atr
+                pos_usd = self._calculate_position_size()
+                print(f"  ★ 開倉 做空 @ {close:.1f} 信號={signal:+.3f} "
+                      f"閾值={short_thr:.3f} 倉位=${pos_usd:.0f} [{self.current_regime}]")
+                self._hl_open("short", f"sig={signal:+.3f} thr={short_thr:.3f}")
+
+        # ═══ 定期狀態報告 ═══
+        if self.candle_count % 20 == 0:
+            self.monitor.print_status()
+            if self.hl_executor:
+                print(f"  {self.hl_executor.status_summary()}")
+            stats = self.regime_detector.get_regime_stats()
+            if stats:
+                print(
+                    f"  市場: {stats['current']} "
+                    f"(趨勢{stats.get('trending_pct', 0):.0f}% "
+                    f"震盪{stats.get('ranging_pct', 0):.0f}% "
+                    f"高波動{stats.get('volatile_pct', 0):.0f}%)"
+                )
+
+        # ═══ 自適應重搜 ═══
+        if self.monitor.needs_retrain:
+            print("\n觸發自適應重搜...")
+            self._run_adaptive_search()
+
+    def _compute_realtime_factors(self, candle):
+        """從單根 K 線計算因子值（使用滾動窗口）"""
+        if not hasattr(self, '_candle_buffer'):
+            self._candle_buffer = []
+        self._candle_buffer.append(candle)
+        if len(self._candle_buffer) > 200:
+            self._candle_buffer = self._candle_buffer[-200:]
+
+        buf = self._candle_buffer
+        n = len(buf)
+        factor_values = {}
+
+        closes = np.array([c["close"] for c in buf])
+        highs = np.array([c.get("high", c["close"]) for c in buf])
+        lows = np.array([c.get("low", c["close"]) for c in buf])
+        volumes = np.array([c.get("volume", 1.0) for c in buf])
+        opens = np.array([c.get("open", c["close"]) for c in buf])
+        obis = np.array([c.get("obi", 0.0) for c in buf])
+
+        # 動量
+        factor_values["roc5"] = (closes[-1] / closes[-6] - 1) if n > 6 else 0.0
+        factor_values["roc20"] = (closes[-1] / closes[-21] - 1) if n > 21 else 0.0
+        roc5_now = factor_values["roc5"]
+        roc5_prev = (closes[-6] / closes[-11] - 1) if n > 11 else 0.0
+        factor_values["mom_accel"] = roc5_now - roc5_prev
+
+        # 均線偏離
+        if n >= 10:
+            ma10 = closes[-10:].mean()
+            factor_values["ma10dev"] = (closes[-1] - ma10) / (ma10 + 1e-10)
+        else:
+            factor_values["ma10dev"] = 0.0
+        if n >= 30:
+            ma30 = closes[-30:].mean()
+            factor_values["ma30dev"] = (closes[-1] - ma30) / (ma30 + 1e-10)
+            ma10 = closes[-10:].mean()
+            factor_values["ma_alignment"] = (ma10 - ma30) / (ma30 + 1e-10)
+        else:
+            factor_values["ma30dev"] = 0.0
+            factor_values["ma_alignment"] = 0.0
+
+        # VWAP 偏離
+        if n >= 20:
+            vwap = np.sum(closes[-20:] * volumes[-20:]) / (np.sum(volumes[-20:]) + 1e-10)
+            factor_values["vwapdev"] = (closes[-1] - vwap) / (vwap + 1e-10)
+        else:
+            factor_values["vwapdev"] = 0.0
+
+        # 波動率因子
+        if n >= 20:
+            std20 = closes[-20:].std()
+            std5 = closes[-5:].std() if n >= 5 else std20
+            factor_values["vol_ratio"] = std5 / (std20 + 1e-10)
+            bb_mid = closes[-20:].mean()
+            factor_values["bb_pctb"] = (closes[-1] - (bb_mid - 2*std20)) / (4*std20 + 1e-10)
+            tr_arr = highs[-20:] - lows[-20:]
+            tr_mean = tr_arr.mean()
+            factor_values["tr_ratio"] = (highs[-1] - lows[-1]) / (tr_mean + 1e-10)
+        else:
+            factor_values["vol_ratio"] = 1.0
+            factor_values["bb_pctb"] = 0.5
+            factor_values["tr_ratio"] = 1.0
+
+        # 成交量因子
+        if n >= 20:
+            vol_ma20 = volumes[-20:].mean()
+            factor_values["vol_surge"] = volumes[-1] / (vol_ma20 + 1e-10)
+            ret1 = (closes[-1] / closes[-2] - 1) if n >= 2 else 0.0
+            factor_values["vol_price_div"] = np.sign(ret1) * (1 - volumes[-1] / (vol_ma20 + 1e-10))
+        else:
+            factor_values["vol_surge"] = 1.0
+            factor_values["vol_price_div"] = 0.0
+
+        # OBV 斜率
+        if n >= 6:
+            obv_deltas = np.sign(np.diff(closes[-6:])) * volumes[-5:]
+            factor_values["obv_slope"] = obv_deltas.sum() / (volumes[-5:].sum() + 1e-10)
+        else:
+            factor_values["obv_slope"] = 0.0
+
+        # 價格衝擊
+        if n >= 2:
+            ret1 = closes[-1] / closes[-2] - 1
+            vol_ma = volumes[-20:].mean() if n >= 20 else volumes.mean()
+            factor_values["priceimpact"] = ret1 * volumes[-1] / (vol_ma + 1e-10)
+        else:
+            factor_values["priceimpact"] = 0.0
+
+        # MACD
+        if n >= 26:
+            ema12 = self._ewm(closes, 12)
+            ema26 = self._ewm(closes, 26)
+            macd_line = ema12 - ema26
+            macd_signal = self._ewm_arr(macd_line[-9:], 9) if len(macd_line) >= 9 else macd_line[-1]
+            factor_values["macdhist"] = macd_line[-1] - macd_signal
+        else:
+            factor_values["macdhist"] = 0.0
+
+        # RSI（標準化到 [-0.5, 0.5]）
+        if n >= 15:
+            rets = np.diff(closes[-15:])
+            gains = rets[rets > 0].mean() if (rets > 0).any() else 0.0
+            losses = (-rets[rets < 0]).mean() if (rets < 0).any() else 0.0
+            factor_values["rsi_norm"] = gains / (gains + losses + 1e-10) - 0.5
+        else:
+            factor_values["rsi_norm"] = 0.0
+
+        # K 線方向
+        factor_values["candle_dir"] = (closes[-1] - opens[-1]) / (highs[-1] - lows[-1] + 1e-10)
+
+        # OBI 因子
+        factor_values["obi"] = obis[-1] if n > 0 else 0.0
+        if n >= 6:
+            factor_values["obi_momentum"] = obis[-1] - obis[-6]
+        else:
+            factor_values["obi_momentum"] = 0.0
+        if n >= 10:
+            factor_values["obi_ma"] = obis[-10:].mean()
+        else:
+            factor_values["obi_ma"] = 0.0
+
+        # 時間因子
+        ts = candle.get("timestamp", 0)
+        if isinstance(ts, (int, float)) and ts > 1e9:
+            hour_rad = 2 * 3.14159 * ((ts / 1000) % 86400) / 86400
+            factor_values["hour_sin"] = np.sin(hour_rad)
+            factor_values["hour_cos"] = np.cos(hour_rad)
+        else:
+            factor_values["hour_sin"] = 0.0
+            factor_values["hour_cos"] = 0.0
+
+        # 持倉量因子（如果有）
+        factor_values.setdefault("oi_roc6", 0.0)
+        factor_values.setdefault("oi_roc24", 0.0)
+        factor_values.setdefault("price_oi_confirm", 0.0)
+
+        # GP 因子
+        if hasattr(self, 'gp_miner') and self._candle_buffer:
+            try:
+                gp_data = {}
+                for col in factor_values:
+                    gp_data[col] = np.array([factor_values[col]])
+                if n >= 30:
+                    buf_factor_data = {}
+                    for key in ["roc5", "roc20", "ma10dev", "ma30dev", "vwapdev",
+                                "priceimpact", "macdhist", "candle_dir",
+                                "vol_ratio", "vol_surge", "obv_slope",
+                                "rsi_norm", "bb_pctb"]:
+                        buf_factor_data[key] = np.zeros(n)
+                    buf_factor_data["roc5"][-1] = factor_values.get("roc5", 0)
+                    buf_factor_data["roc20"][-1] = factor_values.get("roc20", 0)
+                    buf_factor_data["priceimpact"][-1] = factor_values.get("priceimpact", 0)
+                    for fname in self.gp_miner.get_factor_names():
+                        for f in self.gp_miner.discovered_factors:
+                            if f["name"] == fname:
+                                try:
+                                    vals = f["tree"].evaluate(buf_factor_data)
+                                    factor_values[fname] = float(vals[-1])
+                                except Exception:
+                                    factor_values[fname] = 0.0
+                                break
+            except Exception:
+                pass
+
+        return factor_values
+
+    def _ewm(self, arr, span):
+        alpha = 2.0 / (span + 1)
+        result = arr[0]
+        for i in range(1, len(arr)):
+            result = alpha * arr[i] + (1 - alpha) * result
+        return result
+
+    def _ewm_arr(self, arr, span):
+        alpha = 2.0 / (span + 1)
+        result = arr[0]
+        for i in range(1, len(arr)):
+            result = alpha * arr[i] + (1 - alpha) * result
+        return result
+
+    def _calculate_pnl(self, exit_price):
+        if self.position == "long":
+            return (exit_price - self.entry_price) / self.entry_price
+        elif self.position == "short":
+            return (self.entry_price - exit_price) / self.entry_price
+        return 0.0
+
+    async def run(self):
+        print("\n" + "=" * 60)
+        print("BTC-Bot 啟動（v5.0 — 全面升級版）")
+        print(f"  基礎因子: {len(FACTOR_COLS)} 個")
+        print(f"  GP 因子: {len(self.gp_miner.discovered_factors)} 個")
+        print(f"  活躍因子: {len(self.active_factor_cols)} 個")
+        print(f"  市場狀態: {self.current_regime}")
+        if self.hl_executor:
+            print(f"  交易模式: Hyperliquid 實盤 ({HL_LEVERAGE}x 槓桿)")
+            print(f"  帳戶規模: ${HL_ACCOUNT_SIZE}")
+            print(f"  {self.hl_executor.status_summary()}")
+        else:
+            print(f"  交易模式: 純信號（未啟用實盤）")
+        print(f"  ═══ 動態倉位 ═══")
+        print(f"  基礎保證金: ${BASE_POSITION_USD} (範圍 ${MIN_POSITION_USD}~${MAX_POSITION_USD})")
+        print(f"  目標每筆盈利: ${TARGET_PROFIT_PER_TRADE}")
+        print(f"  ═══ 風控參數 ═══")
+        print(f"  止損: {STOP_LOSS_ATR_MULT}×ATR | 止盈: {TAKE_PROFIT_ATR_MULT}×ATR (風險回報比 1:{TAKE_PROFIT_ATR_MULT/STOP_LOSS_ATR_MULT:.0f})")
+        print(f"  最大持倉: {MAX_HOLD_BARS} 根K線 ({MAX_HOLD_BARS*5}分鐘)")
+        print(f"  ═══ 閾值策略 ═══")
+        print(f"  預熱: 前 {DYNAMIC_THRESHOLD_WARMUP} 根K線用搜索閾值80%")
+        print(f"  目標觸發率: {TARGET_TRADE_PCT*100:.0f}%")
+        print(f"  信號 Debug: {'開啟' if SIGNAL_DEBUG else '關閉'} (每{SIGNAL_DEBUG_INTERVAL}根K線)")
+        print("=" * 60)
+        await self.feed.connect()
+
+
+if __name__ == "__main__":
+    bot = BTCBot()
+    asyncio.run(bot.run())
+

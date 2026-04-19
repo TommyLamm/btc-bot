@@ -1,0 +1,190 @@
+"""
+Hyperliquid 交易測試腳本
+測試流程：
+1. 連接帳戶，查詢餘額
+2. 設置槓桿
+3. 開多倉（最小數量）
+4. 等待 5 秒
+5. 平倉
+6. 顯示結果
+"""
+
+import sys
+import time
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+ACCOUNT_ADDRESS = "0x73531FF0bAf770EaFDc25003fAD6E33F7dB682EB"
+SECRET_KEY = "0x64fcb9321defbfb51e563d5775983ad82cb924ab5983608844bf33ff6103556c"
+COIN = "BTC"
+LEVERAGE = 2
+POSITION_SIZE_USD = 10.0
+
+
+def main():
+    print("=" * 60)
+    print("Hyperliquid 交易測試")
+    print("=" * 60)
+
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.exchange import Exchange
+        from hyperliquid.utils import constants
+        import eth_account
+    except ImportError:
+        print("安裝 hyperliquid-python-sdk...")
+        import subprocess
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install",
+            "hyperliquid-python-sdk"
+        ])
+        from hyperliquid.info import Info
+        from hyperliquid.exchange import Exchange
+        from hyperliquid.utils import constants
+        import eth_account
+
+    # 步驟 1：連接帳戶
+    print("\n[1/6] 連接帳戶...")
+    base_url = constants.MAINNET_API_URL
+    info = Info(base_url, skip_ws=True)
+
+    account = eth_account.Account.from_key(SECRET_KEY)
+    exchange = Exchange(account, base_url, account_address=ACCOUNT_ADDRESS)
+
+    user_state = info.user_state(ACCOUNT_ADDRESS)
+    margin = user_state.get("marginSummary", {})
+    account_value = float(margin.get("accountValue", "0"))
+    withdrawable = float(margin.get("withdrawable", "0"))
+
+    print("  帳戶價值: $%.2f" % account_value)
+    print("  可用餘額: $%.2f" % withdrawable)
+
+    if account_value < 5:
+        print("\n帳戶餘額不足！至少需要 $5 USDT")
+        print("  請先在 Hyperliquid 上存入 USDT")
+        return False
+
+    positions = []
+    for pos_info in user_state.get("assetPositions", []):
+        pos = pos_info.get("position", {})
+        if float(pos.get("szi", "0")) != 0:
+            positions.append(pos)
+    if positions:
+        print("  現有持倉: %d 個" % len(positions))
+        for p in positions:
+            print("    %s: %s @ %s" % (p["coin"], p["szi"], p.get("entryPx", "?")))
+    else:
+        print("  現有持倉: 無")
+
+    # 步驟 2：設置槓桿
+    print("\n[2/6] 設置槓桿 %dx..." % LEVERAGE)
+    try:
+        lev_result = exchange.update_leverage(LEVERAGE, COIN, True)
+        print("  結果: %s" % lev_result)
+    except Exception as e:
+        print("  警告: %s（可能已設置，繼續）" % e)
+
+    # 步驟 3：獲取價格
+    print("\n[3/6] 獲取 %s 價格..." % COIN)
+    all_mids = info.all_mids()
+    price = float(all_mids.get(COIN, "0"))
+    print("  %s 中間價: $%.1f" % (COIN, price))
+
+    raw_size = POSITION_SIZE_USD / price
+    size = round(raw_size, 5)
+
+    min_size = round(10.0 / price + 0.000005, 5)
+    if size < min_size:
+        size = min_size
+
+    notional = size * price
+    margin_required = notional / LEVERAGE
+    print("  下單數量: %s %s" % (size, COIN))
+    print("  名義價值: $%.2f" % notional)
+    print("  所需保證金: $%.2f" % margin_required)
+
+    if margin_required > withdrawable:
+        print("\n保證金不足！需要 $%.2f，可用 $%.2f" % (margin_required, withdrawable))
+        return False
+
+    # 步驟 4：開多倉
+    print("\n[4/6] 開多倉 %s %s..." % (size, COIN))
+    try:
+        open_result = exchange.market_open(COIN, True, size, None, 0.01)
+        print("  結果: %s" % open_result)
+
+        if open_result.get("status") == "ok":
+            statuses = open_result["response"]["data"]["statuses"]
+            for s in statuses:
+                if "filled" in s:
+                    f = s["filled"]
+                    print("  成交: #%s | %s @ $%s" % (f["oid"], f["totalSz"], f["avgPx"]))
+                elif "error" in s:
+                    print("  錯誤: %s" % s["error"])
+                    return False
+        else:
+            print("  請求失敗")
+            return False
+    except Exception as e:
+        print("  開倉異常: %s" % e)
+        return False
+
+    # 步驟 5：等待
+    print("\n[5/6] 等待 5 秒...")
+    for i in range(5, 0, -1):
+        print("  %d..." % i, end=" ", flush=True)
+        time.sleep(1)
+    print()
+
+    user_state = info.user_state(ACCOUNT_ADDRESS)
+    for pos_info in user_state.get("assetPositions", []):
+        pos = pos_info.get("position", {})
+        if pos.get("coin") == COIN:
+            szi = pos.get("szi", "0")
+            entry_px = pos.get("entryPx", "?")
+            upnl = pos.get("unrealizedPnl", "0")
+            print("  持倉確認: %s %s @ %s | uPnL=$%s" % (COIN, szi, entry_px, upnl))
+
+    # 步驟 6：平倉
+    print("\n[6/6] 平倉...")
+    try:
+        close_result = exchange.market_close(COIN)
+        print("  結果: %s" % close_result)
+
+        if close_result.get("status") == "ok":
+            statuses = close_result["response"]["data"]["statuses"]
+            for s in statuses:
+                if "filled" in s:
+                    f = s["filled"]
+                    print("  平倉成交: #%s | %s @ $%s" % (f["oid"], f["totalSz"], f["avgPx"]))
+                elif "error" in s:
+                    print("  平倉錯誤: %s" % s["error"])
+        else:
+            print("  平倉請求失敗")
+    except Exception as e:
+        print("  平倉異常: %s" % e)
+        return False
+
+    # 最終狀態
+    print("\n" + "=" * 60)
+    user_state = info.user_state(ACCOUNT_ADDRESS)
+    margin = user_state.get("marginSummary", {})
+    final_value = float(margin.get("accountValue", "0"))
+    pnl = final_value - account_value
+    print("測試完成！")
+    print("  初始帳戶: $%.2f" % account_value)
+    print("  最終帳戶: $%.2f" % final_value)
+    print("  測試損益: $%.4f（含手續費）" % pnl)
+    print("=" * 60)
+
+    return True
+
+
+if __name__ == "__main__":
+    success = main()
+    sys.exit(0 if success else 1)

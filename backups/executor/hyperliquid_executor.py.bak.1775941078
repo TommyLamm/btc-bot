@@ -1,0 +1,373 @@
+"""
+Hyperliquid 實盤交易執行器
+- 支持市價開倉/平倉
+- 自動設置槓桿
+- 持倉狀態追蹤
+- 交易日誌記錄
+"""
+
+import json
+import time
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+import eth_account
+from eth_account.signers.local import LocalAccount
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
+
+
+logger = logging.getLogger("hl_executor")
+
+
+class HyperliquidExecutor:
+    """Hyperliquid 永續合約交易執行器"""
+
+    def __init__(
+        self,
+        account_address: str,
+        secret_key: str,
+        coin: str = "BTC",
+        leverage: int = 2,
+        position_size_usd: float = 10.0,
+        is_cross: bool = True,
+        base_url: str = None,
+        log_dir: str = "logs",
+    ):
+        self.coin = coin
+        self.leverage = leverage
+        self.position_size_usd = position_size_usd
+        self.is_cross = is_cross
+        self.account_address = account_address
+
+        # 初始化 SDK
+        if base_url is None:
+            base_url = constants.MAINNET_API_URL
+
+        account: LocalAccount = eth_account.Account.from_key(secret_key)
+        self.exchange = Exchange(
+            account, base_url, account_address=account_address
+        )
+        self.info = Info(base_url, skip_ws=True)
+
+        # 交易狀態
+        self.current_position = None  # "long", "short", or None
+        self.entry_price = 0.0
+        self.entry_time = None
+        self.position_size = 0.0
+
+        # 交易日誌
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.trade_log_path = self.log_dir / "trades.jsonl"
+
+        # 初始化槓桿
+        self._init_leverage()
+
+        # 同步持倉狀態
+        self._sync_position()
+
+        logger.info(
+            "HyperliquidExecutor 初始化完成 | "
+            "幣種=%s 槓桿=%dx 倉位=%s USDT 模式=%s",
+            coin, leverage, position_size_usd,
+            "全倉" if is_cross else "逐倉"
+        )
+
+    def _init_leverage(self):
+        """設置槓桿"""
+        try:
+            result = self.exchange.update_leverage(
+                self.leverage, self.coin, self.is_cross
+            )
+            logger.info("槓桿設置: %dx -> %s", self.leverage, result)
+        except Exception as e:
+            logger.warning("設置槓桿失敗（可能已設置）: %s", e)
+
+    def _sync_position(self):
+        """從交易所同步當前持倉狀態"""
+        try:
+            user_state = self.info.user_state(self.account_address)
+            for pos_info in user_state.get("assetPositions", []):
+                pos = pos_info.get("position", {})
+                if pos.get("coin") == self.coin:
+                    szi = float(pos.get("szi", "0"))
+                    if szi > 0:
+                        self.current_position = "long"
+                        self.position_size = abs(szi)
+                        self.entry_price = float(pos.get("entryPx", "0"))
+                        logger.info("同步持倉: LONG %s @ %s",
+                                    self.position_size, self.entry_price)
+                    elif szi < 0:
+                        self.current_position = "short"
+                        self.position_size = abs(szi)
+                        self.entry_price = float(pos.get("entryPx", "0"))
+                        logger.info("同步持倉: SHORT %s @ %s",
+                                    self.position_size, self.entry_price)
+                    else:
+                        self.current_position = None
+                        self.position_size = 0.0
+                    return
+
+            self.current_position = None
+            self.position_size = 0.0
+        except Exception as e:
+            logger.error("同步持倉失敗: %s", e)
+
+    def get_account_info(self) -> dict:
+        """查詢帳戶信息"""
+        try:
+            user_state = self.info.user_state(self.account_address)
+            margin = user_state.get("marginSummary", {})
+            return {
+                "account_value": float(margin.get("accountValue", "0")),
+                "total_margin_used": float(margin.get("totalMarginUsed", "0")),
+                "total_ntl_pos": float(margin.get("totalNtlPos", "0")),
+                "withdrawable": float(margin.get("withdrawable", "0")),
+            }
+        except Exception as e:
+            logger.error("查詢帳戶失敗: %s", e)
+            return {}
+
+    def get_mid_price(self) -> float:
+        """獲取當前中間價"""
+        try:
+            all_mids = self.info.all_mids()
+            return float(all_mids.get(self.coin, "0"))
+        except Exception as e:
+            logger.error("獲取價格失敗: %s", e)
+            return 0.0
+
+    def _calculate_size(self, price: float) -> float:
+        """計算下單數量（BTC）"""
+        if price <= 0:
+            return 0.0
+
+        raw_size = self.position_size_usd / price
+        size = round(raw_size, 5)
+
+        # 確保至少 $10 名義價值
+        min_notional = 10.0
+        min_size = min_notional / price
+        min_size = round(min_size + 0.000005, 5)
+
+        if size < min_size:
+            logger.warning(
+                "計算數量 %s 低於最低要求 %s，使用最低數量",
+                size, min_size
+            )
+            size = min_size
+
+        return size
+
+    def open_long(self, reason: str = "") -> dict:
+        """開多倉"""
+        if self.current_position == "long":
+            logger.info("已有多倉，跳過")
+            return {"status": "skip", "reason": "already_long"}
+
+        if self.current_position == "short":
+            self.close_position("反轉為多倉")
+
+        price = self.get_mid_price()
+        if price <= 0:
+            return {"status": "error", "reason": "price_unavailable"}
+
+        size = self._calculate_size(price)
+        logger.info("開多倉: %s %s @ ~%.1f (名義 ~$%.2f)",
+                     self.coin, size, price, size * price)
+
+        try:
+            result = self.exchange.market_open(
+                self.coin, True, size, None, 0.01
+            )
+            self._process_order_result(result, "open_long", price, size, reason)
+            return result
+        except Exception as e:
+            logger.error("開多倉失敗: %s", e)
+            return {"status": "error", "reason": str(e)}
+
+    def open_short(self, reason: str = "") -> dict:
+        """開空倉"""
+        if self.current_position == "short":
+            logger.info("已有空倉，跳過")
+            return {"status": "skip", "reason": "already_short"}
+
+        if self.current_position == "long":
+            self.close_position("反轉為空倉")
+
+        price = self.get_mid_price()
+        if price <= 0:
+            return {"status": "error", "reason": "price_unavailable"}
+
+        size = self._calculate_size(price)
+        logger.info("開空倉: %s %s @ ~%.1f (名義 ~$%.2f)",
+                     self.coin, size, price, size * price)
+
+        try:
+            result = self.exchange.market_open(
+                self.coin, False, size, None, 0.01
+            )
+            self._process_order_result(result, "open_short", price, size, reason)
+            return result
+        except Exception as e:
+            logger.error("開空倉失敗: %s", e)
+            return {"status": "error", "reason": str(e)}
+
+    def close_position(self, reason: str = "") -> dict:
+        """平倉"""
+        if self.current_position is None:
+            logger.info("無持倉，跳過平倉")
+            return {"status": "skip", "reason": "no_position"}
+
+        price = self.get_mid_price()
+        logger.info("平倉: %s %s @ ~%.1f | 原因: %s",
+                     self.current_position, self.coin, price, reason)
+
+        try:
+            result = self.exchange.market_close(self.coin)
+            self._process_close_result(result, price, reason)
+            return result
+        except Exception as e:
+            logger.error("平倉失敗: %s", e)
+            return {"status": "error", "reason": str(e)}
+
+    def _process_order_result(self, result, action, price, size, reason):
+        """處理開倉結果"""
+        if result.get("status") == "ok":
+            statuses = (
+                result.get("response", {})
+                .get("data", {})
+                .get("statuses", [])
+            )
+            for status in statuses:
+                if "filled" in status:
+                    filled = status["filled"]
+                    fill_price = float(filled.get("avgPx", price))
+                    fill_size = float(filled.get("totalSz", size))
+                    oid = filled.get("oid", "")
+
+                    if "long" in action:
+                        self.current_position = "long"
+                    else:
+                        self.current_position = "short"
+                    self.entry_price = fill_price
+                    self.position_size = fill_size
+                    self.entry_time = datetime.now(timezone.utc)
+
+                    logger.info("成交 %s: #%s %s @ %s",
+                                action, oid, fill_size, fill_price)
+
+                    self._log_trade({
+                        "time": self.entry_time.isoformat(),
+                        "action": action,
+                        "coin": self.coin,
+                        "size": fill_size,
+                        "price": fill_price,
+                        "oid": oid,
+                        "reason": reason,
+                    })
+                elif "error" in status:
+                    logger.error("%s 失敗: %s", action, status["error"])
+        else:
+            logger.error("%s 請求失敗: %s", action, result)
+
+    def _process_close_result(self, result, price, reason):
+        """處理平倉結果"""
+        if result.get("status") == "ok":
+            statuses = (
+                result.get("response", {})
+                .get("data", {})
+                .get("statuses", [])
+            )
+            for status in statuses:
+                if "filled" in status:
+                    filled = status["filled"]
+                    fill_price = float(filled.get("avgPx", price))
+                    fill_size = float(filled.get("totalSz", "0"))
+                    oid = filled.get("oid", "")
+
+                    pnl = 0.0
+                    if self.current_position == "long":
+                        pnl = (fill_price - self.entry_price) * fill_size
+                    elif self.current_position == "short":
+                        pnl = (self.entry_price - fill_price) * fill_size
+
+                    logger.info("平倉成交: #%s %s @ %s | PnL=$%.4f",
+                                oid, fill_size, fill_price, pnl)
+
+                    self._log_trade({
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "action": "close",
+                        "side": self.current_position,
+                        "coin": self.coin,
+                        "size": fill_size,
+                        "entry_price": self.entry_price,
+                        "exit_price": fill_price,
+                        "pnl": round(pnl, 4),
+                        "oid": oid,
+                        "reason": reason,
+                    })
+
+                    self.current_position = None
+                    self.position_size = 0.0
+                    self.entry_price = 0.0
+                    self.entry_time = None
+
+                elif "error" in status:
+                    logger.error("平倉失敗: %s", status["error"])
+        else:
+            logger.error("平倉請求失敗: %s", result)
+
+    def execute_signal(self, signal: int, reason: str = "") -> dict:
+        """根據信號執行交易 (1=多, -1=空, 0=平倉)"""
+        if signal == 1:
+            if self.current_position == "long":
+                return {"status": "skip", "reason": "already_long"}
+            return self.open_long(reason)
+        elif signal == -1:
+            if self.current_position == "short":
+                return {"status": "skip", "reason": "already_short"}
+            return self.open_short(reason)
+        elif signal == 0:
+            if self.current_position is not None:
+                return self.close_position(reason)
+            return {"status": "skip", "reason": "no_position"}
+        else:
+            return {"status": "error", "reason": "invalid_signal"}
+
+    def _log_trade(self, trade_data: dict):
+        """記錄交易到日誌文件"""
+        try:
+            with open(self.trade_log_path, "a") as f:
+                f.write(json.dumps(trade_data, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error("寫入交易日誌失敗: %s", e)
+
+    def status_summary(self) -> str:
+        """返回當前狀態摘要"""
+        acct = self.get_account_info()
+        pos_str = "無持倉"
+        if self.current_position:
+            price = self.get_mid_price()
+            if self.current_position == "long":
+                upnl = (price - self.entry_price) * self.position_size
+            else:
+                upnl = (self.entry_price - price) * self.position_size
+            pos_str = (
+                "%s %s %s @ %.1f | uPnL=$%.4f" % (
+                    self.current_position.upper(),
+                    self.position_size, self.coin,
+                    self.entry_price, upnl
+                )
+            )
+
+        return (
+            "帳戶: $%.2f | 已用保證金: $%.2f | 持倉: %s" % (
+                acct.get("account_value", 0),
+                acct.get("total_margin_used", 0),
+                pos_str
+            )
+        )

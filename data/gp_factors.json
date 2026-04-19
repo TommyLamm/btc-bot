@@ -1,0 +1,1220 @@
+[
+  {
+    "name": "gp_04121848_0",
+    "expr": "log1p((neg(ma30dev) - ma_alignment))",
+    "tree": {
+      "type": "unary",
+      "value": "log1p",
+      "children": [
+        {
+          "type": "binary",
+          "value": "sub",
+          "children": [
+            {
+              "type": "unary",
+              "value": "neg",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "ma30dev"
+                }
+              ]
+            },
+            {
+              "type": "factor",
+              "value": "ma_alignment"
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.04219708894981805,
+    "ic_ir": 1.691132254649372
+  },
+  {
+    "name": "gp_04121848_1",
+    "expr": "tanh((neg(ma30dev) - ma_alignment))",
+    "tree": {
+      "type": "unary",
+      "value": "tanh",
+      "children": [
+        {
+          "type": "binary",
+          "value": "sub",
+          "children": [
+            {
+              "type": "unary",
+              "value": "neg",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "ma30dev"
+                }
+              ]
+            },
+            {
+              "type": "factor",
+              "value": "ma_alignment"
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.04219708894981805,
+    "ic_ir": 1.691132254649372
+  },
+  {
+    "name": "gp_04121848_2",
+    "expr": "log1p(((-1.06 * ma_alignment) - ma30dev))",
+    "tree": {
+      "type": "unary",
+      "value": "log1p",
+      "children": [
+        {
+          "type": "binary",
+          "value": "sub",
+          "children": [
+            {
+              "type": "binary",
+              "value": "mul",
+              "children": [
+                {
+                  "type": "const",
+                  "value": -1.06
+                },
+                {
+                  "type": "factor",
+                  "value": "ma_alignment"
+                }
+              ]
+            },
+            {
+              "type": "factor",
+              "value": "ma30dev"
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.041957168997323054,
+    "ic_ir": 1.7011818581325855
+  },
+  {
+    "name": "gp_04121848_3",
+    "expr": "log1p(((-1.48 - ma_alignment) - ma30dev))",
+    "tree": {
+      "type": "unary",
+      "value": "log1p",
+      "children": [
+        {
+          "type": "binary",
+          "value": "sub",
+          "children": [
+            {
+              "type": "binary",
+              "value": "sub",
+              "children": [
+                {
+                  "type": "const",
+                  "value": -1.48
+                },
+                {
+                  "type": "factor",
+                  "value": "ma_alignment"
+                }
+              ]
+            },
+            {
+              "type": "factor",
+              "value": "ma30dev"
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.04219708894981805,
+    "ic_ir": 1.691132254649372
+  },
+  {
+    "name": "gp_04121848_4",
+    "expr": "log1p(((-1.82 - ma30dev) - ma_alignment))",
+    "tree": {
+      "type": "unary",
+      "value": "log1p",
+      "children": [
+        {
+          "type": "binary",
+          "value": "sub",
+          "children": [
+            {
+              "type": "binary",
+              "value": "sub",
+              "children": [
+                {
+                  "type": "const",
+                  "value": -1.82
+                },
+                {
+                  "type": "factor",
+                  "value": "ma30dev"
+                }
+              ]
+            },
+            {
+              "type": "factor",
+              "value": "ma_alignment"
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.04219708894981805,
+    "ic_ir": 1.691132254649372
+  },
+  {
+    "name": "gp_04121903_0",
+    "expr": "log1p(((-1.64 - ma30dev) - diff(mom_accel, 5)))",
+    "tree": {
+      "type": "unary",
+      "value": "log1p",
+      "children": [
+        {
+          "type": "binary",
+          "value": "sub",
+          "children": [
+            {
+              "type": "binary",
+              "value": "sub",
+              "children": [
+                {
+                  "type": "const",
+                  "value": -1.64
+                },
+                {
+                  "type": "factor",
+                  "value": "ma30dev"
+                }
+              ]
+            },
+            {
+              "type": "window",
+              "value": "diff",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "mom_accel"
+                }
+              ],
+              "window": 5
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.06873660110853756,
+    "ic_ir": 0.8805193181723457
+  },
+  {
+    "name": "gp_04121903_1",
+    "expr": "tanh(neg(ewm(rolling_mean(max(obv_slope, obv_slope), 20), 5)))",
+    "tree": {
+      "type": "unary",
+      "value": "tanh",
+      "children": [
+        {
+          "type": "unary",
+          "value": "neg",
+          "children": [
+            {
+              "type": "window",
+              "value": "ewm",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_mean",
+                  "children": [
+                    {
+                      "type": "binary",
+                      "value": "max",
+                      "children": [
+                        {
+                          "type": "factor",
+                          "value": "obv_slope"
+                        },
+                        {
+                          "type": "factor",
+                          "value": "obv_slope"
+                        }
+                      ]
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 5
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.028718261732391354,
+    "ic_ir": 0.9594438407865662
+  },
+  {
+    "name": "gp_04121903_2",
+    "expr": "log1p(neg(ewm(rolling_mean(max(obv_slope, obv_slope), 20), 5)))",
+    "tree": {
+      "type": "unary",
+      "value": "log1p",
+      "children": [
+        {
+          "type": "unary",
+          "value": "neg",
+          "children": [
+            {
+              "type": "window",
+              "value": "ewm",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_mean",
+                  "children": [
+                    {
+                      "type": "binary",
+                      "value": "max",
+                      "children": [
+                        {
+                          "type": "factor",
+                          "value": "obv_slope"
+                        },
+                        {
+                          "type": "factor",
+                          "value": "obv_slope"
+                        }
+                      ]
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 5
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.028718261732391354,
+    "ic_ir": 0.9594438407865662
+  },
+  {
+    "name": "gp_04121903_3",
+    "expr": "tanh(neg(ewm(rolling_mean((obv_slope + obv_slope), 20), 5)))",
+    "tree": {
+      "type": "unary",
+      "value": "tanh",
+      "children": [
+        {
+          "type": "unary",
+          "value": "neg",
+          "children": [
+            {
+              "type": "window",
+              "value": "ewm",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_mean",
+                  "children": [
+                    {
+                      "type": "binary",
+                      "value": "add",
+                      "children": [
+                        {
+                          "type": "factor",
+                          "value": "obv_slope"
+                        },
+                        {
+                          "type": "factor",
+                          "value": "obv_slope"
+                        }
+                      ]
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 5
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.028718261732391354,
+    "ic_ir": 0.9594438407865662
+  },
+  {
+    "name": "gp_04121903_4",
+    "expr": "min(square(bb_pctb), (tanh(neg(bb_pctb)) + ma10dev))",
+    "tree": {
+      "type": "binary",
+      "value": "min",
+      "children": [
+        {
+          "type": "unary",
+          "value": "square",
+          "children": [
+            {
+              "type": "factor",
+              "value": "bb_pctb"
+            }
+          ]
+        },
+        {
+          "type": "binary",
+          "value": "add",
+          "children": [
+            {
+              "type": "unary",
+              "value": "tanh",
+              "children": [
+                {
+                  "type": "unary",
+                  "value": "neg",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "bb_pctb"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "factor",
+              "value": "ma10dev"
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.04067697516731094,
+    "ic_ir": 0.9705599303372738
+  },
+  {
+    "name": "gp_04121421_0",
+    "expr": "rolling_mean(sign(neg(rolling_mean(vol_impact_hl, 3))), 3)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "unary",
+          "value": "sign",
+          "children": [
+            {
+              "type": "unary",
+              "value": "neg",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_mean",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "vol_impact_hl"
+                    }
+                  ],
+                  "window": 3
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "window": 3
+    },
+    "ic": 0.09236887009573236,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121421_1",
+    "expr": "rolling_mean(neg(sign(rolling_mean(vol_impact_hl, 3))), 3)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "unary",
+          "value": "neg",
+          "children": [
+            {
+              "type": "unary",
+              "value": "sign",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_mean",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "vol_impact_hl"
+                    }
+                  ],
+                  "window": 3
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "window": 3
+    },
+    "ic": 0.09236887009573236,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121421_2",
+    "expr": "rolling_mean(sign(rolling_mean(vol_impact_hl, 3)), 3)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "unary",
+          "value": "sign",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_mean",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "vol_impact_hl"
+                }
+              ],
+              "window": 3
+            }
+          ]
+        }
+      ],
+      "window": 3
+    },
+    "ic": 0.08869565367802633,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04120751_1",
+    "expr": "rolling_mean((rolling_std(oi_roc6, 10) * (rolling_rank(macdhist, 20) * priceimpact)), 5)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "oi_roc6"
+                }
+              ],
+              "window": 10
+            },
+            {
+              "type": "binary",
+              "value": "mul",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "macdhist"
+                    }
+                  ],
+                  "window": 20
+                },
+                {
+                  "type": "factor",
+                  "value": "priceimpact"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "window": 5
+    },
+    "ic": 0.09017076939504683,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04120751_4",
+    "expr": "rolling_mean((rolling_std(oi_roc6, 10) * (rolling_std(macdhist, 20) * priceimpact)), 5)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "oi_roc6"
+                }
+              ],
+              "window": 10
+            },
+            {
+              "type": "binary",
+              "value": "mul",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_std",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "macdhist"
+                    }
+                  ],
+                  "window": 20
+                },
+                {
+                  "type": "factor",
+                  "value": "priceimpact"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "window": 5
+    },
+    "ic": 0.08769535697147333,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121227_3",
+    "expr": "((roc5 * rolling_std(macdhist, 10)) * rolling_rank(rolling_rank(oi_roc24, 10), 20))",
+    "tree": {
+      "type": "binary",
+      "value": "mul",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "factor",
+              "value": "roc5"
+            },
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "macdhist"
+                }
+              ],
+              "window": 10
+            }
+          ]
+        },
+        {
+          "type": "window",
+          "value": "rolling_rank",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_rank",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "oi_roc24"
+                }
+              ],
+              "window": 10
+            }
+          ],
+          "window": 20
+        }
+      ]
+    },
+    "ic": 0.08564050828342114,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04120751_0",
+    "expr": "rolling_mean((rolling_std(diff(oi_roc6, 10), 10) * (rolling_std(macdhist, 20) * priceimpact)), 5)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "diff",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc6"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            },
+            {
+              "type": "binary",
+              "value": "mul",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_std",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "macdhist"
+                    }
+                  ],
+                  "window": 20
+                },
+                {
+                  "type": "factor",
+                  "value": "priceimpact"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "window": 5
+    },
+    "ic": 0.09092327746627875,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121227_0",
+    "expr": "((roc5 * rolling_std(rolling_rank(oi_roc24, 20), 10)) * rolling_rank(rolling_rank(oi_roc24, 20), 10))",
+    "tree": {
+      "type": "binary",
+      "value": "mul",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "factor",
+              "value": "roc5"
+            },
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc24"
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 10
+            }
+          ]
+        },
+        {
+          "type": "window",
+          "value": "rolling_rank",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_rank",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "oi_roc24"
+                }
+              ],
+              "window": 20
+            }
+          ],
+          "window": 10
+        }
+      ]
+    },
+    "ic": 0.08851440521915549,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04120751_2",
+    "expr": "rolling_mean((rolling_std(diff(oi_roc6, 10), 10) * (rolling_std(oi_roc6, 10) * priceimpact)), 5)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "diff",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc6"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            },
+            {
+              "type": "binary",
+              "value": "mul",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_std",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc6"
+                    }
+                  ],
+                  "window": 10
+                },
+                {
+                  "type": "factor",
+                  "value": "priceimpact"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "window": 5
+    },
+    "ic": 0.08835812822140915,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04120751_3",
+    "expr": "rolling_mean((rolling_std(diff(oi_roc6, 10), 10) * (rolling_std(oi_roc6, 10) * vol_impact_hl)), 5)",
+    "tree": {
+      "type": "window",
+      "value": "rolling_mean",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "diff",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc6"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            },
+            {
+              "type": "binary",
+              "value": "mul",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_std",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc6"
+                    }
+                  ],
+                  "window": 10
+                },
+                {
+                  "type": "factor",
+                  "value": "vol_impact_hl"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "window": 5
+    },
+    "ic": 0.08835812822140915,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121227_1",
+    "expr": "((roc5 * rolling_std(rolling_rank(oi_roc24, 10), 10)) * rolling_rank(rolling_rank(oi_roc24, 20), 20))",
+    "tree": {
+      "type": "binary",
+      "value": "mul",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "factor",
+              "value": "roc5"
+            },
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc24"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            }
+          ]
+        },
+        {
+          "type": "window",
+          "value": "rolling_rank",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_rank",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "oi_roc24"
+                }
+              ],
+              "window": 20
+            }
+          ],
+          "window": 20
+        }
+      ]
+    },
+    "ic": 0.0861116998365636,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121227_2",
+    "expr": "((roc5 * rolling_rank(rolling_rank(oi_roc24, 20), 10)) * rolling_rank(rolling_rank(rolling_rank(oi_roc24, 10), 10), 20))",
+    "tree": {
+      "type": "binary",
+      "value": "mul",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "factor",
+              "value": "roc5"
+            },
+            {
+              "type": "window",
+              "value": "rolling_rank",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc24"
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 10
+            }
+          ]
+        },
+        {
+          "type": "window",
+          "value": "rolling_rank",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_rank",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc24"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            }
+          ],
+          "window": 20
+        }
+      ]
+    },
+    "ic": 0.0860421920296055,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121227_4",
+    "expr": "((roc5 * rolling_rank(rolling_rank(oi_roc24, 20), 10)) * rolling_rank(rolling_rank(rolling_rank(oi_roc24, 10), 10), 10))",
+    "tree": {
+      "type": "binary",
+      "value": "mul",
+      "children": [
+        {
+          "type": "binary",
+          "value": "mul",
+          "children": [
+            {
+              "type": "factor",
+              "value": "roc5"
+            },
+            {
+              "type": "window",
+              "value": "rolling_rank",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc24"
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 10
+            }
+          ]
+        },
+        {
+          "type": "window",
+          "value": "rolling_rank",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_rank",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "oi_roc24"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            }
+          ],
+          "window": 10
+        }
+      ]
+    },
+    "ic": 0.08544412346845379,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121447_1",
+    "expr": "(rolling_std(rolling_std(rolling_rank(ma30dev, 10), 10), 20) * min(rolling_std(rolling_std(ma30dev, 20), 20), neg(roc5)))",
+    "tree": {
+      "type": "binary",
+      "value": "mul",
+      "children": [
+        {
+          "type": "window",
+          "value": "rolling_std",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_rank",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "ma30dev"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            }
+          ],
+          "window": 20
+        },
+        {
+          "type": "binary",
+          "value": "min",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_std",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "ma30dev"
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 20
+            },
+            {
+              "type": "unary",
+              "value": "neg",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "roc5"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.08995958290790014,
+    "ic_ir": 0
+  },
+  {
+    "name": "gp_04121447_2",
+    "expr": "(rolling_std(rolling_std(rolling_std(ma30dev, 10), 10), 20) * min(rolling_std(rolling_std(ma30dev, 20), 20), neg(roc5)))",
+    "tree": {
+      "type": "binary",
+      "value": "mul",
+      "children": [
+        {
+          "type": "window",
+          "value": "rolling_std",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_std",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "ma30dev"
+                    }
+                  ],
+                  "window": 10
+                }
+              ],
+              "window": 10
+            }
+          ],
+          "window": 20
+        },
+        {
+          "type": "binary",
+          "value": "min",
+          "children": [
+            {
+              "type": "window",
+              "value": "rolling_std",
+              "children": [
+                {
+                  "type": "window",
+                  "value": "rolling_std",
+                  "children": [
+                    {
+                      "type": "factor",
+                      "value": "ma30dev"
+                    }
+                  ],
+                  "window": 20
+                }
+              ],
+              "window": 20
+            },
+            {
+              "type": "unary",
+              "value": "neg",
+              "children": [
+                {
+                  "type": "factor",
+                  "value": "roc5"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "ic": 0.08929446662559869,
+    "ic_ir": 0
+  }
+]

@@ -1,0 +1,388 @@
+"""
+BTC-Bot 主程序（自適應進化版 v3.3 — 即時閾值版）
+核心修復：
+  1. generate_signal 使用搜索時的因子列表（維度正確）
+  2. 不再用歷史預熱（歷史和即時信號分佈不同）
+  3. 預熱期用低初始閾值（0.15），確保立即能交易
+  4. 收集到 20 根即時 K 線後，切換到動態閾值（基於即時分佈）
+"""
+
+import asyncio
+import polars as pl
+import numpy as np
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from data.realtime_feed import BTCRealtimeFeed
+from factors.factor_engine import compute_factors
+from factors.regime_detector import RegimeDetector
+from engine.genetic_engine import GeneticEngine, FACTOR_COLS
+from engine.gp_factor_miner import GPFactorMiner, BASE_FACTORS
+from monitor.performance_monitor import PerformanceMonitor
+
+# ═══ Hyperliquid 交易配置 ═══
+HL_ENABLED = os.environ.get("HL_ENABLED", "true").lower() == "true"
+HL_SECRET_KEY = os.environ.get(
+    "HL_SECRET_KEY",
+    "0xf3ddcc9a128d6251033058f671450a929b32d47389886c664f4497fe1c100e99",
+)
+HL_ACCOUNT_ADDRESS = os.environ.get(
+    "HL_ACCOUNT_ADDRESS",
+    "0x73531FF0bAf770EaFDc25003fAD6E33F7dB682EB",
+)
+HL_LEVERAGE = int(os.environ.get("HL_LEVERAGE", "2"))
+HL_POSITION_SIZE_USD = float(os.environ.get("HL_POSITION_SIZE_USD", "10.0"))
+
+# ═══ 交易頻率配置 ═══
+TARGET_TRADE_PCT = float(os.environ.get("TARGET_TRADE_PCT", "0.08"))
+DYNAMIC_THRESHOLD_WARMUP = int(os.environ.get("DYNAMIC_THRESHOLD_WARMUP", "20"))
+# 預熱期初始閾值（設得低，確保前 20 根 K 線就能交易）
+INITIAL_THRESHOLD = float(os.environ.get("INITIAL_THRESHOLD", "0.15"))
+SIGNAL_DEBUG = os.environ.get("SIGNAL_DEBUG", "true").lower() == "true"
+
+
+class BTCBot:
+    def __init__(self):
+        self.feed = BTCRealtimeFeed(buffer_size=25000)
+        self.feed.on_candle_close(self.on_candle_close)
+
+        print("載入歷史數據...")
+        self.df_history = pl.read_parquet("data/btc_5m.parquet").sort("timestamp")
+        print(f"  歷史K線: {len(self.df_history)} 根")
+
+        try:
+            self.oi_df = pl.read_parquet("data/btc_oi.parquet").sort("timestamp")
+            print(f"  持倉量數據: {len(self.oi_df)} 條")
+        except Exception:
+            self.oi_df = None
+            print("  無持倉量數據")
+
+        self.engine = GeneticEngine(pop_size=300, n_generations=60)
+        self.gp_miner = GPFactorMiner(
+            pop_size=200, n_generations=40, max_depth=4,
+            ic_threshold=0.02, max_new_factors=5,
+            save_path="data/gp_factors.json",
+        )
+        self.regime_detector = RegimeDetector()
+        self.monitor = PerformanceMonitor(window_size=200, retrain_threshold=0.50)
+        self.monitor.initial_threshold = INITIAL_THRESHOLD
+
+        self.position = None
+        self.entry_price = 0.0
+        self.search_count = 0
+        self.gp_mine_count = 0
+        self.current_regime = "unknown"
+        self.active_factor_cols = list(FACTOR_COLS)
+        self.candle_count = 0
+        self.no_trade_count = 0
+
+        # ═══ Hyperliquid 交易執行器 ═══
+        self.hl_executor = None
+        if HL_ENABLED:
+            try:
+                from executor.hyperliquid_executor import HyperliquidExecutor
+                self.hl_executor = HyperliquidExecutor(
+                    secret_key=HL_SECRET_KEY,
+                    account_address=HL_ACCOUNT_ADDRESS,
+                    leverage=HL_LEVERAGE,
+                    position_size_usd=HL_POSITION_SIZE_USD,
+                    coin="BTC",
+                    log_path="logs/trades.jsonl",
+                )
+                print(f"\n  [HL] 交易模組已啟用")
+                print(f"  [HL] {self.hl_executor.status_summary()}")
+            except Exception as e:
+                print(f"\n  [HL] 交易模組啟動失敗: {e}")
+                self.hl_executor = None
+
+        print("\n初始因子搜索...")
+        self._run_adaptive_search()
+
+    def _prepare_factor_data(self, df):
+        df = compute_factors(df, oi_df=self.oi_df)
+        df = df.drop_nulls().fill_nan(0)
+        if len(df) < 100:
+            return df, {}
+        factor_data = {}
+        for col in BASE_FACTORS:
+            if col in df.columns:
+                factor_data[col] = df[col].to_numpy().astype(np.float64)
+            else:
+                factor_data[col] = np.zeros(len(df))
+        gp_data = self.gp_miner.compute_gp_factors(factor_data)
+        for name, values in gp_data.items():
+            if len(values) == len(df):
+                df = df.with_columns(pl.Series(name=name, values=values))
+        return df, factor_data
+
+    def _run_gp_mining(self, factor_data, returns):
+        self.gp_mine_count += 1
+        print(f"\n  GP 因子挖掘（第 {self.gp_mine_count} 次）...")
+        new_factors = self.gp_miner.mine(factor_data, returns)
+        if new_factors:
+            gp_names = self.gp_miner.get_top_factors(n=5)
+            self.active_factor_cols = list(FACTOR_COLS) + gp_names
+            print(f"  活躍因子數: {len(self.active_factor_cols)}")
+
+    def _detect_regime(self, df):
+        if len(df) < 100:
+            return {"regime": "unknown", "factor_weights": {}}
+        high = df["high"].to_numpy().astype(np.float64)
+        low = df["low"].to_numpy().astype(np.float64)
+        close = df["close"].to_numpy().astype(np.float64)
+        result = self.regime_detector.detect(high, low, close)
+        self.current_regime = result["regime"]
+        return result
+
+    def _run_adaptive_search(self):
+        self.search_count += 1
+        print(f"\n{'='*60}")
+        print(f"第 {self.search_count} 次自適應搜索")
+        print(f"{'='*60}")
+
+        df, factor_data = self._prepare_factor_data(self.df_history.tail(5000))
+        if len(df) < 100:
+            print("數據不足，跳過搜索")
+            return
+
+        regime_info = self._detect_regime(df)
+        regime = regime_info.get("regime", "unknown")
+        confidence = regime_info.get("confidence", 0)
+        adx = regime_info.get("adx", 0)
+        print(f"  市場狀態: {regime} (置信度={confidence:.2f}, ADX={adx:.1f})")
+
+        if factor_data and (self.search_count % 3 == 1 or self.search_count == 1):
+            close = df["close"].to_numpy().astype(np.float64)
+            returns = np.zeros(len(close))
+            returns[:-1] = (close[1:] - close[:-1]) / close[:-1]
+            self._run_gp_mining(factor_data, returns)
+            df, factor_data = self._prepare_factor_data(self.df_history.tail(5000))
+
+        self._update_engine_factors()
+
+        # 記錄搜索時的因子列表（關鍵！）
+        search_cols = list(FACTOR_COLS)
+
+        print(f"\n  遺傳搜索（{len(search_cols)} 個因子）...")
+        result = self.engine.search(df)
+
+        if result:
+            regime_weights = regime_info.get("factor_weights", {})
+            if regime_weights and result.get("weights") is not None:
+                adjusted_weights = result["weights"].copy()
+                for i, col in enumerate(self.engine.factor_cols_used):
+                    if col in regime_weights:
+                        adjusted_weights[i] *= regime_weights[col]
+                norm = np.linalg.norm(adjusted_weights)
+                if norm > 1e-10:
+                    adjusted_weights = adjusted_weights / norm
+                result["weights"] = adjusted_weights
+                result["regime"] = regime
+
+            # 傳入搜索時的因子列表
+            self.monitor.set_factor(result, factor_cols=search_cols)
+
+            threshold = result.get("threshold", 0.5)
+            print(f"  搜索閾值: {threshold:.4f} (僅供參考，不使用)")
+            print(f"  初始閾值: {INITIAL_THRESHOLD} (前 {DYNAMIC_THRESHOLD_WARMUP} 根K線使用)")
+            print(f"  之後切換到即時動態閾值（基於即時信號分佈，上限 0.8）")
+
+            print(f"搜索完成 (市場狀態={regime})")
+        else:
+            print("搜索失敗")
+
+        self.no_trade_count = 0
+
+    def _update_engine_factors(self):
+        import engine.genetic_engine as ge
+        ge.FACTOR_COLS = list(self.active_factor_cols)
+        self.engine.n_factors = len(self.active_factor_cols)
+
+    def _hl_open(self, direction: str, price: float, signal: float):
+        if not self.hl_executor:
+            return
+        reason = f"signal={signal:+.3f} regime={self.current_regime} price={price:.1f}"
+        try:
+            if direction == "long":
+                result = self.hl_executor.open_long(reason)
+            else:
+                result = self.hl_executor.open_short(reason)
+            if result["status"] == "ok":
+                print(f"  [HL] 實盤開倉: {result['direction']} {result['size']} BTC @ ${result['price']:,.1f}")
+            elif result["status"] != "skip":
+                print(f"  [HL] 開倉失敗: {result.get('msg', '')}")
+        except Exception as e:
+            print(f"  [HL] 開倉異常: {e}")
+
+    def _hl_close(self, reason: str = ""):
+        if not self.hl_executor:
+            return
+        try:
+            result = self.hl_executor.close_position(reason)
+            if result["status"] == "ok":
+                print(f"  [HL] 實盤平倉: {result['direction']} @ ${result['price']:,.1f} PnL=${result['pnl']:+.4f}")
+            elif result["status"] != "skip":
+                print(f"  [HL] 平倉失敗: {result.get('msg', '')}")
+        except Exception as e:
+            print(f"  [HL] 平倉異常: {e}")
+
+    async def on_candle_close(self, candle, buffer):
+        self.candle_count += 1
+
+        new_row = pl.DataFrame([{
+            "timestamp": candle["timestamp"],
+            "open": candle["open"], "high": candle["high"],
+            "low": candle["low"], "close": candle["close"],
+            "volume": candle["volume"],
+        }])
+        for col in self.df_history.columns:
+            if col not in new_row.columns:
+                new_row = new_row.with_columns(pl.lit(None).alias(col))
+        new_row = new_row.select(self.df_history.columns)
+        self.df_history = pl.concat([self.df_history, new_row])
+
+        df_recent = compute_factors(self.df_history.tail(5000), oi_df=self.oi_df)
+        if len(df_recent) == 0:
+            return
+
+        last_row = df_recent.tail(1)
+        factor_values = {}
+
+        # 使用搜索時的因子列表
+        search_cols = self.monitor.search_factor_cols or FACTOR_COLS
+        for col in search_cols:
+            if col in last_row.columns:
+                val = last_row[col].to_list()[0]
+                factor_values[col] = float(val) if val is not None else 0.0
+            else:
+                factor_values[col] = 0.0
+
+        # GP 因子
+        factor_data = {}
+        for col in BASE_FACTORS:
+            if col in df_recent.columns:
+                factor_data[col] = df_recent[col].to_numpy().astype(np.float64)
+            else:
+                factor_data[col] = np.zeros(len(df_recent))
+        gp_values = self.gp_miner.compute_gp_factors(factor_data)
+        for name, values in gp_values.items():
+            if len(values) > 0:
+                factor_values[name] = float(values[-1])
+
+        if "obi" in candle:
+            factor_values["obi"] = candle["obi"]
+
+        # ═══ 生成信號 ═══
+        signal = self.monitor.generate_signal(factor_values)
+
+        # ═══ 決定閾值 ═══
+        n_realtime = len(self.monitor.realtime_signal_buffer)
+        dyn_thr = self.monitor.get_dynamic_threshold(TARGET_TRADE_PCT, DYNAMIC_THRESHOLD_WARMUP)
+
+        if dyn_thr is not None:
+            # 預熱完成，使用動態閾值
+            threshold = dyn_thr
+            thr_source = "dynamic"
+        else:
+            # 預熱期，使用低初始閾值
+            threshold = INITIAL_THRESHOLD
+            thr_source = "initial"
+
+        # ═══ 判斷交易方向 ═══
+        action = None
+        if signal > threshold:
+            action = "long"
+        elif signal < -threshold:
+            action = "short"
+
+        # ═══ 信號 Debug 輸出（每 3 根 K 線） ═══
+        if SIGNAL_DEBUG and self.candle_count % 3 == 0:
+            action_str = action if action else "hold"
+            if thr_source == "dynamic":
+                thr_info = f"dyn={threshold:.4f}"
+            else:
+                thr_info = f"init={threshold:.4f} ({n_realtime}/{DYNAMIC_THRESHOLD_WARMUP})"
+            print(f"  [信號] sig={signal:+.4f} {thr_info} → {action_str}")
+
+        # ═══ 交易邏輯 ═══
+        traded = False
+
+        # 平倉邏輯
+        if self.position is not None:
+            if (self.position == "long" and action != "long") or \
+               (self.position == "short" and action != "short"):
+                pnl = self._calculate_pnl(candle["close"])
+                self.monitor.record_trade(pnl)
+                print(f"  平倉 {self.position} @ {candle['close']:.1f} PnL={pnl:+.4f}")
+                self._hl_close(f"signal_exit pnl={pnl:+.4f}")
+                self.position = None
+                self.entry_price = 0.0
+                traded = True
+
+        # 開倉邏輯
+        if action and self.position is None:
+            self.position = action
+            direction = "做多" if action == "long" else "做空"
+            print(f"  ★ 開倉 {direction} @ {candle['close']:.1f} 信號={signal:+.3f} 閾值={threshold:.3f} [{self.current_regime}]")
+            self.entry_price = candle["close"]
+            self._hl_open(action, candle["close"], signal)
+            traded = True
+            self.no_trade_count = 0
+
+        if not traded:
+            self.no_trade_count += 1
+
+        # ═══ 定期狀態報告（每 30 根 K 線） ═══
+        if self.candle_count % 30 == 0:
+            self.monitor.print_status()
+            if self.hl_executor:
+                print(f"  {self.hl_executor.status_summary()}")
+            if len(df_recent) >= 100:
+                high = df_recent["high"].to_numpy().astype(np.float64)
+                low = df_recent["low"].to_numpy().astype(np.float64)
+                close = df_recent["close"].to_numpy().astype(np.float64)
+                self.regime_detector.detect(high, low, close)
+                stats = self.regime_detector.get_regime_stats()
+                print(
+                    f"  市場: {stats['current']} "
+                    f"(趨勢{stats.get('trending_pct', 0):.0f}% "
+                    f"震盪{stats.get('ranging_pct', 0):.0f}% "
+                    f"高波動{stats.get('volatile_pct', 0):.0f}%)"
+                )
+
+        # ═══ 自適應重搜 ═══
+        if self.monitor.needs_retrain:
+            print("\n觸發自適應重搜（勝率過低）...")
+            self._run_adaptive_search()
+
+    def _calculate_pnl(self, exit_price):
+        if self.position == "long":
+            return (exit_price - self.entry_price) / self.entry_price
+        elif self.position == "short":
+            return (self.entry_price - exit_price) / self.entry_price
+        return 0.0
+
+    async def run(self):
+        print("\n" + "=" * 60)
+        print("BTC-Bot 啟動（自適應進化版 v3.3 — 即時閾值版）")
+        print(f"  基礎因子: 12 個")
+        print(f"  GP 因子: {len(self.gp_miner.discovered_factors)} 個")
+        print(f"  活躍因子: {len(self.active_factor_cols)} 個")
+        print(f"  市場狀態: {self.current_regime}")
+        if self.hl_executor:
+            print(f"  交易模式: Hyperliquid 實盤 ({HL_LEVERAGE}x 槓桿, ${HL_POSITION_SIZE_USD} 保證金)")
+            print(f"  {self.hl_executor.status_summary()}")
+        else:
+            print(f"  交易模式: 純信號（未啟用實盤）")
+        print(f"  閾值策略: 初始={INITIAL_THRESHOLD} → {DYNAMIC_THRESHOLD_WARMUP}根K線後動態 (目標{TARGET_TRADE_PCT*100:.0f}%)")
+        print(f"  預期交易: 每天 {int(288*TARGET_TRADE_PCT)}~{int(288*TARGET_TRADE_PCT*1.5)} 次")
+        print(f"  信號 Debug: {'開啟' if SIGNAL_DEBUG else '關閉'} (每3根K線)")
+        print("=" * 60)
+        await self.feed.connect()
+
+
+if __name__ == "__main__":
+    bot = BTCBot()
+    asyncio.run(bot.run())

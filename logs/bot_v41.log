@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/root/btc-bot/main.py", line 619, in <module>
+    bot = BTCBot()
+          ^^^^^^^^
+  File "/root/btc-bot/main.py", line 63, in __init__
+    self.feed = BTCRealtimeFeed(callback=self.on_candle_close)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: BTCRealtimeFeed.__init__() got an unexpected keyword argument 'callback'
