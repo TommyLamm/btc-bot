@@ -1,7 +1,9 @@
 import polars as pl
 import numpy as np
+import os
 import sys
-sys.path.insert(0, "/root/btc-bot")
+# Bug 21 Fix：使用動態路徑而非硬編碼
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def add_nonlinear_factors(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -9,9 +11,9 @@ def add_nonlinear_factors(df: pl.DataFrame) -> pl.DataFrame:
     只对 IC 最高的几个因子做组合，避免维度爆炸
     """
 
-    # 确保基础因子存在
-    required = ["ma10_dev", "roc_5", "price_impact",
-                "price_oi_confirm", "vwap_dev"]
+    # Bug 21 Fix：因子名稱對齊 v5.0（移除底線分隔）
+    required = ["ma10dev", "roc5", "priceimpact",
+                "price_oi_confirm", "vwapdev"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         print(f"缺少因子: {missing}")
@@ -21,22 +23,22 @@ def add_nonlinear_factors(df: pl.DataFrame) -> pl.DataFrame:
 
         # ── 交互项：两个因子同向时信号更强 ──────────────
         # 均线偏离 × 短期动量（都超买时更可能反转）
-        (pl.col("ma10_dev") * pl.col("roc_5")).alias("ma10_x_roc5"),
+        (pl.col("ma10dev") * pl.col("roc5")).alias("ma10_x_roc5"),
 
         # 价格冲击 × 持仓量确认（量价齐升时趋势更可信）
-        (pl.col("price_impact") * pl.col("price_oi_confirm")).alias("impact_x_oi"),
+        (pl.col("priceimpact") * pl.col("price_oi_confirm")).alias("impact_x_oi"),
 
         # VWAP偏离 × 均线偏离（双重偏离信号）
-        (pl.col("vwap_dev") * pl.col("ma10_dev")).alias("vwap_x_ma10"),
+        (pl.col("vwapdev") * pl.col("ma10dev")).alias("vwap_x_ma10"),
 
         # ── 非线性变换：捕捉极端值 ───────────────────────
         # 偏离程度的平方（惩罚极端偏离）
-        (pl.col("ma10_dev") ** 2 * pl.col("ma10_dev").sign()).alias("ma10_dev_sq"),
+        (pl.col("ma10dev") ** 2 * pl.col("ma10dev").sign()).alias("ma10_dev_sq"),
 
         # ── 条件因子：只在特定市场状态下激活 ────────────
         # 高波动时的均线偏离（高波动下反转更快）
-        (pl.col("ma10_dev") *
-         pl.col("roc_5").abs()).alias("ma10_dev_vol_weighted"),
+        (pl.col("ma10dev") *
+         pl.col("roc5").abs()).alias("ma10_dev_vol_weighted"),
 
     ])
 

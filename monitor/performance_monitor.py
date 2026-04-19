@@ -16,7 +16,12 @@ class PerformanceMonitor:
         self.window_size = window_size
         self.retrain_threshold = retrain_threshold
         self.trade_results = deque(maxlen=window_size)
-        self.all_trades = []
+        # Bug 19 Fix：限制 all_trades 大小，用累計變數追蹤全域統計
+        self.all_trades = deque(maxlen=2000)
+        self.total_trade_count = 0
+        self.cumulative_pnl = 0.0
+        self.cumulative_wins = 0.0
+        self.cumulative_losses_abs = 0.0
         self.current_factor = None
         self.needs_retrain = False
 
@@ -81,6 +86,13 @@ class PerformanceMonitor:
         self.trade_results.append(1 if pnl_net > 0 else 0)
         self.all_trades.append(pnl_net)
         self.recent_pnl.append(pnl_net)
+        # Bug 19 Fix：累計追蹤，避免全量掃描
+        self.total_trade_count += 1
+        self.cumulative_pnl += pnl_net
+        if pnl_net > 0:
+            self.cumulative_wins += pnl_net
+        else:
+            self.cumulative_losses_abs += abs(pnl_net)
 
         # 連續虧損追蹤
         if pnl_net <= 0:
@@ -218,15 +230,13 @@ class PerformanceMonitor:
         win_rate = sum(self.trade_results) / len(self.trade_results)
         long_pct = self.long_signal_count / max(1, self.total_signal_count)
 
-        # 計算 PF
-        gains = sum(p for p in self.all_trades if p > 0)
-        losses = abs(sum(p for p in self.all_trades if p < 0))
-        pf = gains / (losses + 1e-10)
+        # Bug 19 Fix：使用累計變數，O(1) 計算全域 PF
+        pf = self.cumulative_wins / (self.cumulative_losses_abs + 1e-10)
 
         return {
             "win_rate": win_rate,
-            "n_trades": len(self.all_trades),
-            "total_pnl": sum(self.all_trades),
+            "n_trades": self.total_trade_count,
+            "total_pnl": self.cumulative_pnl,
             "profit_factor": pf,
             "needs_retrain": self.needs_retrain,
             "consecutive_losses": self.consecutive_losses,

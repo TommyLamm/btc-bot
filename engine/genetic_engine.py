@@ -147,6 +147,7 @@ class GeneticEngine:
         return {
             "win_rate": win_rate,
             "n_trades": n_trades,
+            "n_bars": len(score),  # Bug 22 Fix：傳遞數據長度供 fitness 計算 trades_per_day
             "profit_factor": profit_factor,
             "sharpe": sharpe,
             "net_pnl": net_pnl,
@@ -184,7 +185,9 @@ class GeneticEngine:
         dd_penalty = max(0, max_dd - 0.02) * 200
 
         # 交易次數獎勵（鼓勵適度交易）
-        n_days = max(1, nt / 288)
+        # Bug 22 Fix：用數據的總 K 線數估算天數，而非交易次數
+        n_bars = metrics.get("n_bars", nt)
+        n_days = max(1, n_bars / 288)
         trades_per_day = nt / n_days
         if trades_per_day < 5:
             freq_bonus = -10

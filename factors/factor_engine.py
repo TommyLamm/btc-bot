@@ -126,8 +126,8 @@ def compute_factors(df: pl.DataFrame, oi_df: pl.DataFrame = None) -> pl.DataFram
         # K 線方向（實體 / 振幅）
         ((pl.col("close") - pl.col("open"))
          / (pl.col("high") - pl.col("low") + 1e-10)).alias("candle_dir"),
-        # 上影線比例
-        ((pl.col("high") - pl.col("close").clip(pl.col("open"), None).fill_null(pl.col("close")))
+        # 上影線比例（Bug 12 Fix：使用 max_horizontal 確保 Polars 版本相容性）
+        ((pl.col("high") - pl.max_horizontal(pl.col("close"), pl.col("open")))
          / (pl.col("high") - pl.col("low") + 1e-10)).alias("upper_shadow"),
     ])
 

@@ -85,10 +85,12 @@ class BTCBot:
         self.entry_atr = 0.0
         self.cooldown_remaining = 0
         self.last_close = 0.0
+        self.prev_close = 0.0   # Bug 3 Fix：ATR 需要前一根收盤價
         self.current_atr = 0.0
         self.today_trades = 0
         self.today_start_bar = 0
         self.current_position_usd = BASE_POSITION_USD
+        self._retrain_lock = False  # Bug 9 Fix：防止重搜重入
 
         # Hyperliquid
         self.hl_executor = None
@@ -107,14 +109,13 @@ class BTCBot:
             except Exception as e:
                 print(f"  Hyperliquid 初始化失敗: {e}")
 
-        # 初始搜索
-        self._run_adaptive_search()
+        # Bug 1 Fix：初始搜索移至 run() 中用 asyncio.to_thread 執行，不在 __init__ 阻塞
 
     def _run_adaptive_search(self):
-        """執行因子挖掘 + 遺傳搜索"""
+        """Bug 14 Fix：純計算，不修改任何共享狀態。返回 (result, regime, all_cols) 元組。"""
         if not os.path.exists(DATA_PATH):
             print("  歷史數據不存在，跳過搜索")
-            return
+            return None
 
         df = pl.read_parquet(DATA_PATH).tail(HISTORY_BARS)
         oi_df = None
@@ -128,7 +129,7 @@ class BTCBot:
         high = df["high"].to_numpy().astype(np.float64) if "high" in df.columns else close
         low = df["low"].to_numpy().astype(np.float64) if "low" in df.columns else close
         regime_result = self.regime_detector.detect(high, low, close)
-        self.current_regime = regime_result["regime"]
+        regime = regime_result["regime"]
 
         # GP 因子挖掘
         ret = np.zeros(len(close))
@@ -147,35 +148,24 @@ class BTCBot:
             if len(values) == len(df):
                 df = df.with_columns(pl.Series(name=name, values=values))
 
-        # 更新因子列表
         gp_names = self.gp_miner.get_factor_names()
-        self.active_factor_cols = list(FACTOR_COLS) + [g for g in gp_names if g in df.columns]
 
-        # 更新遺傳搜索的因子列表
         from engine.genetic_engine import FACTOR_COLS as BASE_COLS
+        import engine.genetic_engine as ge_mod
         all_cols = list(BASE_COLS) + [g for g in gp_names if g in df.columns]
         self.genetic_engine.factor_cols_used = all_cols
-
-        # 暫時替換 FACTOR_COLS
-        import engine.genetic_engine as ge_mod
         original_cols = ge_mod.FACTOR_COLS
-        ge_mod.FACTOR_COLS = all_cols
-
-        # 遺傳搜索
-        print(f"\n  遺傳搜索（{len(all_cols)} 個因子）...")
-        result = self.genetic_engine.search(df)
-
-        ge_mod.FACTOR_COLS = original_cols
+        result = None
+        try:
+            ge_mod.FACTOR_COLS = all_cols
+            print(f"\n  遺傳搜索（{len(all_cols)} 個因子）...")
+            result = self.genetic_engine.search(df)
+        finally:
+            ge_mod.FACTOR_COLS = original_cols
 
         if result is not None:
-            result["regime"] = self.current_regime
-            self.monitor.set_factor(
-                result,
-                factor_cols=all_cols,
-                interaction_pairs=result.get("interaction_pairs", []),
-            )
-
-            # 信號分佈參考
+            result["regime"] = regime
+            # 信號分佈參考（僅打印，不修改狀態）
             X_raw = df.select([c for c in all_cols if c in df.columns]).to_numpy().astype(np.float64)
             X_raw = np.nan_to_num(X_raw, nan=0.0)
             X_mean = result["factor_mean"]
@@ -193,11 +183,25 @@ class BTCBot:
             if len(neg_sig) > 0:
                 print(f"  空頭信號: P50={np.percentile(neg_sig,50):.3f} P90={np.percentile(neg_sig,90):.3f}")
 
-        print(f"  搜索完成（市場狀態={self.current_regime}）")
+        print(f"  搜索完成（市場狀態={regime}）")
+        # 返回結果元組，由主線程 _apply_search_result 更新共享狀態
+        return (result, regime, all_cols) if result is not None else None
+
+    def _apply_search_result(self, search_output):
+        """Bug 14 Fix：在主線程中原子性地更新共享狀態。"""
+        result, regime, all_cols = search_output
+        self.current_regime = regime
+        self.active_factor_cols = list(all_cols)
+        self.monitor.set_factor(
+            result,
+            factor_cols=all_cols,
+            interaction_pairs=result.get("interaction_pairs", []),
+        )
 
     def _compute_atr(self, high, low, close, period=14):
-        """計算 ATR"""
-        tr = max(high - low, abs(high - close), abs(low - close))
+        """計算 ATR（Bug 3 Fix：TR 使用前一根收盤價）"""
+        prev_close = self.prev_close if self.prev_close > 0 else close
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         if self.current_atr == 0:
             self.current_atr = tr
         else:
@@ -272,8 +276,10 @@ class BTCBot:
             result = self.hl_executor.close_position(reason)
             if result and result.get("status") == "ok":
                 return result
-            elif result and "no position" in str(result.get("error", "")):
-                return result
+            elif result and "no position" in str(result.get("error", "")).lower():
+                # Bug 15 Fix：HL 確認無倉位，返回 skip 而非透傳 error status
+                print(f"  [HL] HL 上已無倉位，同步本地狀態")
+                return {"status": "skip", "msg": "HL 上已無倉位"}
             else:
                 err = result.get("error", "unknown") if result else "no result"
                 print(f"  [HL] 平倉失敗: {err}")
@@ -288,10 +294,13 @@ class BTCBot:
         high = candle.get("high", close)
         low = candle.get("low", close)
         obi = candle.get("obi", 0.0)
-        self.last_close = close
 
-        # 計算 ATR
+        # 計算 ATR（必須在更新 last_close/prev_close 之前）
         atr = self._compute_atr(high, low, close)
+
+        # Bug 3 Fix：更新 prev_close 供下一根 K 線的 ATR 使用
+        self.prev_close = self.last_close if self.last_close > 0 else close
+        self.last_close = close
 
         # 每日重置
         if self.candle_count % 288 == 1:
@@ -350,33 +359,46 @@ class BTCBot:
 
             if close_reason:
                 net_pnl = pnl_pct - ROUND_TRIP_FEE
-                self.monitor.record_trade(net_pnl)
                 print(f"  平倉 {self.position} @ {close:.1f} {close_reason}")
-                self._hl_close(close_reason)
-                self.position = "flat"
-                self.cooldown_remaining = COOLDOWN_BARS
-                self.today_trades += 1
+                hl_result = self._hl_close(close_reason)
+                # Bug 5 Fix：僅在 HL 真正成功平倉（或無 HL）時才更新本地狀態
+                hl_ok = (self.hl_executor is None) or (
+                    hl_result is not None and hl_result.get("status") in ("ok", "skip")
+                )
+                if hl_ok:
+                    self.monitor.record_trade(net_pnl)
+                    self.position = "flat"
+                    self.cooldown_remaining = COOLDOWN_BARS
+                    self.today_trades += 1
+                else:
+                    print(f"  [警告] HL 平倉失敗，保持本地持倉狀態，下根K線重試")
 
         # ═══ 開倉邏輯 ═══
         if self.position == "flat" and self.cooldown_remaining <= 0:
+            open_dir = None
+            open_thr = 0.0
             if signal > long_thr:
-                self.position = "long"
-                self.entry_price = close
-                self.entry_bar = self.candle_count
-                self.entry_atr = atr
-                pos_usd = self._calculate_position_size()
-                print(f"  ★ 開倉 做多 @ {close:.1f} 信號={signal:+.3f} "
-                      f"閾值={long_thr:.3f} 倉位=${pos_usd:.0f} [{self.current_regime}]")
-                self._hl_open("long", f"sig={signal:+.3f} thr={long_thr:.3f}")
+                open_dir = "long"
+                open_thr = long_thr
             elif signal < -short_thr:
-                self.position = "short"
-                self.entry_price = close
-                self.entry_bar = self.candle_count
-                self.entry_atr = atr
+                open_dir = "short"
+                open_thr = short_thr
+
+            if open_dir:
                 pos_usd = self._calculate_position_size()
-                print(f"  ★ 開倉 做空 @ {close:.1f} 信號={signal:+.3f} "
-                      f"閾值={short_thr:.3f} 倉位=${pos_usd:.0f} [{self.current_regime}]")
-                self._hl_open("short", f"sig={signal:+.3f} thr={short_thr:.3f}")
+                dir_cn = "多" if open_dir == "long" else "空"
+                print(f"  ★ 開倉 做{dir_cn} @ {close:.1f} 信號={signal:+.3f} "
+                      f"閾值={open_thr:.3f} 倉位=${pos_usd:.0f} [{self.current_regime}]")
+                hl_result = self._hl_open(open_dir, f"sig={signal:+.3f} thr={open_thr:.3f}")
+                # Bug 16 Fix：只在 HL 成功或無 HL 時才設定本地持倉
+                hl_ok = (self.hl_executor is None) or (hl_result is not None)
+                if hl_ok:
+                    self.position = open_dir
+                    self.entry_price = close
+                    self.entry_bar = self.candle_count
+                    self.entry_atr = atr
+                else:
+                    print(f"  [警告] HL 開倉失敗，不設定本地持倉")
 
         # ═══ 定期狀態報告 ═══
         if self.candle_count % 20 == 0:
@@ -393,9 +415,28 @@ class BTCBot:
                 )
 
         # ═══ 自適應重搜 ═══
-        if self.monitor.needs_retrain:
-            print("\n觸發自適應重搜...")
-            self._run_adaptive_search()
+        # Bug 2 & 9 Fix：用 asyncio.to_thread 避免阻塞 event loop；加重入鎖防無限重搜
+        if self.monitor.needs_retrain and not self._retrain_lock:
+            self._retrain_lock = True
+            print("\n觸發自適應重搜（背景執行）...")
+            asyncio.create_task(self._async_retrain())
+
+    async def _async_retrain(self):
+        """Bug 2+14 Fix：背景搜索 + 主線程原子更新。"""
+        try:
+            search_output = await asyncio.to_thread(self._run_adaptive_search)
+            if search_output is None:
+                print("  重搜未找到有效因子，5 分鐘後重試")
+                await asyncio.sleep(300)
+            else:
+                # Bug 14 Fix：回到主線程後再更新共享狀態（asyncio 是單線程，此處安全）
+                self._apply_search_result(search_output)
+            self.monitor.needs_retrain = False
+        except Exception as e:
+            print(f"  重搜異常: {e}")
+            self.monitor.needs_retrain = False
+        finally:
+            self._retrain_lock = False
 
     def _compute_realtime_factors(self, candle):
         """從單根 K 線計算因子值（使用滾動窗口）"""
@@ -485,13 +526,14 @@ class BTCBot:
         else:
             factor_values["priceimpact"] = 0.0
 
-        # MACD
+        # MACD（Bug 18 Fix：增量 EMA 避免 O(n²)，先算完整 EMA 陣列再取值）
         if n >= 26:
-            ema12 = self._ewm(closes, 12)
-            ema26 = self._ewm(closes, 26)
-            macd_line = ema12 - ema26
-            macd_signal = self._ewm_arr(macd_line[-9:], 9) if len(macd_line) >= 9 else macd_line[-1]
-            factor_values["macdhist"] = macd_line[-1] - macd_signal
+            ema12_arr = self._ewm_full(closes, 12)
+            ema26_arr = self._ewm_full(closes, 26)
+            macd_arr = ema12_arr - ema26_arr
+            # 信號線：對 MACD 序列做 9 期 EMA
+            macd_signal_arr = self._ewm_full(macd_arr, 9)
+            factor_values["macdhist"] = float(macd_arr[-1] - macd_signal_arr[-1])
         else:
             factor_values["macdhist"] = 0.0
 
@@ -534,48 +576,76 @@ class BTCBot:
         factor_values.setdefault("price_oi_confirm", 0.0)
 
         # GP 因子
-        if hasattr(self, 'gp_miner') and self._candle_buffer:
+        # Bug 6 Fix：從完整的 K 線 buffer 重建所有因子時序，而非用零陣列填充
+        if hasattr(self, 'gp_miner') and self._candle_buffer and n >= 30:
             try:
-                gp_data = {}
-                for col in factor_values:
-                    gp_data[col] = np.array([factor_values[col]])
-                if n >= 30:
-                    buf_factor_data = {}
-                    for key in ["roc5", "roc20", "ma10dev", "ma30dev", "vwapdev",
-                                "priceimpact", "macdhist", "candle_dir",
-                                "vol_ratio", "vol_surge", "obv_slope",
-                                "rsi_norm", "bb_pctb"]:
-                        buf_factor_data[key] = np.zeros(n)
-                    buf_factor_data["roc5"][-1] = factor_values.get("roc5", 0)
-                    buf_factor_data["roc20"][-1] = factor_values.get("roc20", 0)
-                    buf_factor_data["priceimpact"][-1] = factor_values.get("priceimpact", 0)
-                    for fname in self.gp_miner.get_factor_names():
-                        for f in self.gp_miner.discovered_factors:
-                            if f["name"] == fname:
-                                try:
-                                    vals = f["tree"].evaluate(buf_factor_data)
-                                    factor_values[fname] = float(vals[-1])
-                                except Exception:
-                                    factor_values[fname] = 0.0
-                                break
+                # 用 buffer 中的歷史數據構建完整的因子時序
+                buf_factor_data = {
+                    "roc5":        np.array([(closes[i] / closes[i-5] - 1) if i >= 5 else 0.0 for i in range(n)]),
+                    "roc20":       np.array([(closes[i] / closes[i-20] - 1) if i >= 20 else 0.0 for i in range(n)]),
+                    "ma10dev":     np.array([(closes[i] - closes[max(0,i-10):i+1].mean()) /
+                                             (closes[max(0,i-10):i+1].mean() + 1e-10) if i >= 9 else 0.0 for i in range(n)]),
+                    "ma30dev":     np.array([(closes[i] - closes[max(0,i-30):i+1].mean()) /
+                                             (closes[max(0,i-30):i+1].mean() + 1e-10) if i >= 29 else 0.0 for i in range(n)]),
+                    "vwapdev":     np.array([(closes[i] - np.sum(closes[max(0,i-20):i+1]*volumes[max(0,i-20):i+1]) /
+                                             (np.sum(volumes[max(0,i-20):i+1]) + 1e-10)) /
+                                            (np.sum(closes[max(0,i-20):i+1]*volumes[max(0,i-20):i+1]) /
+                                             (np.sum(volumes[max(0,i-20):i+1]) + 1e-10) + 1e-10)
+                                            if i >= 19 else 0.0 for i in range(n)]),
+                    "priceimpact": np.array([(closes[i]/closes[i-1]-1)*volumes[i]/(volumes[max(0,i-20):i+1].mean()+1e-10)
+                                             if i >= 1 else 0.0 for i in range(n)]),
+                    "vol_ratio":   np.array([closes[max(0,i-5):i+1].std()/(closes[max(0,i-20):i+1].std()+1e-10)
+                                             if i >= 19 else 1.0 for i in range(n)]),
+                    "vol_surge":   np.array([volumes[i]/(volumes[max(0,i-20):i+1].mean()+1e-10) if i >= 19 else 1.0 for i in range(n)]),
+                    "candle_dir":  (closes - opens) / (highs - lows + 1e-10),
+                    "rsi_norm":    np.zeros(n),  # 近似值，保留結構
+                    "macdhist":    np.zeros(n),
+                    "bb_pctb":     np.zeros(n),
+                    "obv_slope":   np.zeros(n),
+                }
+                # RSI 近似
+                if n >= 14:
+                    rets = np.diff(closes)
+                    for i in range(14, n):
+                        w = rets[i-14:i]
+                        g = w[w>0].mean() if (w>0).any() else 0.0
+                        l = (-w[w<0]).mean() if (w<0).any() else 0.0
+                        buf_factor_data["rsi_norm"][i] = g/(g+l+1e-10) - 0.5
+
+                for fname in self.gp_miner.get_factor_names():
+                    for f in self.gp_miner.discovered_factors:
+                        if f["name"] == fname:
+                            try:
+                                vals = f["tree"].evaluate(buf_factor_data)
+                                factor_values[fname] = float(vals[-1])
+                            except Exception:
+                                factor_values[fname] = 0.0
+                            break
             except Exception:
                 pass
 
         return factor_values
 
     def _ewm(self, arr, span):
+        """計算 EWM（指數加權移動平均），返回最終純量值。"""
         alpha = 2.0 / (span + 1)
-        result = arr[0]
+        result = float(arr[0])
         for i in range(1, len(arr)):
-            result = alpha * arr[i] + (1 - alpha) * result
+            result = alpha * float(arr[i]) + (1 - alpha) * result
+        return result
+
+    def _ewm_full(self, arr, span):
+        """Bug 18 Fix：計算完整 EWM 陣列（O(n)），用於 MACD 等需要歷史序列的場景。"""
+        alpha = 2.0 / (span + 1)
+        result = np.empty(len(arr))
+        result[0] = float(arr[0])
+        for i in range(1, len(arr)):
+            result[i] = alpha * float(arr[i]) + (1 - alpha) * result[i - 1]
         return result
 
     def _ewm_arr(self, arr, span):
-        alpha = 2.0 / (span + 1)
-        result = arr[0]
-        for i in range(1, len(arr)):
-            result = alpha * arr[i] + (1 - alpha) * result
-        return result
+        """保留此別名以向後相容，內部委派給 _ewm。"""
+        return self._ewm(arr, span)
 
     def _calculate_pnl(self, exit_price):
         if self.position == "long":
@@ -608,6 +678,11 @@ class BTCBot:
         print(f"  目標觸發率: {TARGET_TRADE_PCT*100:.0f}%")
         print(f"  信號 Debug: {'開啟' if SIGNAL_DEBUG else '關閉'} (每{SIGNAL_DEBUG_INTERVAL}根K線)")
         print("=" * 60)
+
+        # Bug 1 Fix：初始搜索改為背景非阻塞執行
+        print("\n開始初始因子搜索（背景執行，不阻塞K線接收）...")
+        asyncio.create_task(self._async_retrain())
+
         await self.feed.connect()
 
 

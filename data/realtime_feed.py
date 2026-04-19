@@ -20,6 +20,7 @@ class BTCRealtimeFeed:
         self.obi_buffer = deque(maxlen=buffer_size)
         self.current_candle = None
         self.callbacks = []
+        self._obi_save_counter = 0  # Bug 10 Fix：獨立計數器，不依賴 buffer 長度
 
     def on_candle_close(self, callback):
         self.callbacks.append(callback)
@@ -46,7 +47,9 @@ class BTCRealtimeFeed:
         print("WebSocket 連接中...")
         while True:
             try:
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(
+                    url, ping_interval=30, ping_timeout=30
+                ) as ws:
                     print("已連接，開始接收數據")
                     async for message in ws:
                         await self._handle_message(json.loads(message))
@@ -67,13 +70,16 @@ class BTCRealtimeFeed:
         }
         self.current_candle = candle
         if candle["is_closed"]:
-            obi_data = self.fetch_obi()
+            # Bug 4 Fix：用 asyncio.to_thread 執行同步 HTTP 請求，不阻塞 event loop
+            obi_data = await asyncio.to_thread(self.fetch_obi)
             candle.update(obi_data)
             self.buffer.append(candle)
             self.obi_buffer.append({"timestamp": candle["timestamp"], **obi_data})
             dt = datetime.fromtimestamp(candle["timestamp"] / 1000, tz=timezone.utc)
             print(f"K線收盤 {dt.strftime('%H:%M')} | close={candle['close']:.1f} | OBI={obi_data['obi']:+.3f}")
-            if len(self.obi_buffer) % 100 == 0:
+            # Bug 10 Fix：用獨立計數器，避免 buffer 滿後永遠觸發
+            self._obi_save_counter += 1
+            if self._obi_save_counter % 100 == 0:
                 self.save_obi()
             for cb in self.callbacks:
                 await cb(candle, list(self.buffer))
